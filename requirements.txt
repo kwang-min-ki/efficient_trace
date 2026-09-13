@@ -1,0 +1,9 @@
+vllm
+transformers
+datasets
+pandas
+pyarrow
+scikit-learn
+numpy
+matplotlib
+openai  # label_ar_lsat_llm_judge.py only (GRIFT App. B Table 6 GPT-5 judge)
