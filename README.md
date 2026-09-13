@@ -1,4 +1,4 @@
-# simple_trace
+# Trace
 
 TRACE reproduction and Likelihood-TRACE research on math/code IC.
 Active models: Llama-3.2-3B-Instruct and Phi-4-mini-instruct; Qwen2.5 remains
