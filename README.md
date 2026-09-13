@@ -415,7 +415,7 @@ record-preparation/filtering plus-scoring scope in both scripts; it excludes
 source generation, model loading, and file I/O. The `.stats` metadata records the
 configured/effective rollout batch and `per_cutoff_scoring_rows` explicitly.
 
-## Optional HF/Likelihood-TRACE comparison
+## HF/Likelihood-TRACE comparison
 
 These scripts are independent of the main vLLM pipeline; the examples below cover math/code:
 
