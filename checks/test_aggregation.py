@@ -1,9 +1,4 @@
-"""Min-K%++ / Gap-K% aggregation, checked against the papers' own formulas.
-
-The scores are computed here from an explicit toy distribution so the tests fail if the
-implementation drifts from Min-K%++ Eq. 3-4 (Zhang et al., ICLR 2025) or Gap-K% Eq. 5-7
-(Kwak & Kim, 2026), not merely if it changes.
-"""
+"""고정 확률 분포 기반 Likelihood 집계 공식·경계값 검증"""
 
 import math
 import sys
@@ -15,7 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-import likelihood_trace_hf as L  # noqa: E402
+import likelihood_trace as L  # noqa: E402
 
 
 def stats_from_distribution(probs, target):

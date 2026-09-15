@@ -1,13 +1,10 @@
-"""Check masked cutoff likelihoods against uncached forwards on real architectures.
-
-Tiny random CPU models exercise Llama/Phi attention and cache code without weights.
-"""
+"""소형 Llama/Qwen2 CPU 모델의 캐시 점수와 독립 추론 결과 비교"""
 import unittest
 
 import torch
-from transformers import LlamaConfig, LlamaForCausalLM, Phi3Config, Phi3ForCausalLM
+from transformers import LlamaConfig, LlamaForCausalLM, Qwen2Config, Qwen2ForCausalLM
 
-from likelihood_trace_hf import likelihood_curve_cached
+from likelihood_trace import likelihood_curve_cached
 
 
 class Tokenizer:
@@ -19,7 +16,7 @@ class InstructCacheTest(unittest.TestCase):
     def test_masked_cache_matches_independent_prefix_forward(self):
         torch.manual_seed(42)
         for config_cls, model_cls in ((LlamaConfig, LlamaForCausalLM),
-                                       (Phi3Config, Phi3ForCausalLM)):
+                                       (Qwen2Config, Qwen2ForCausalLM)):
             with self.subTest(architecture=model_cls.__name__):
                 config = config_cls(vocab_size=32, hidden_size=32,
                                     intermediate_size=64, num_hidden_layers=2,

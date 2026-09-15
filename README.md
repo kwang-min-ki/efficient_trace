@@ -1,474 +1,258 @@
-# Trace
+# Efficient TRACE
 
-TRACE reproduction and Likelihood-TRACE research on math/code IC.
-Active models: Llama-3.2-3B-Instruct and Phi-4-mini-instruct; Qwen2.5 remains
-the original baseline. AR-LSAT is deferred; its code and artifacts are archived in place.
+**목표:** 수학·코드 문제에서 추론(CoT)에 숨은 보상 해킹 탐지 — 탐지 성능과 계산 비용의 개선
 
-## Files
+- **보상 해킹:** 실제 문제 해결 대신 입력 힌트(IC)·채점 규칙의 허점(RM)을 이용한 보상 획득
+- **TRACE:** 추론을 여러 길이로 자른 뒤 답 재생성·채점
+- **Efficient TRACE:** 각 추론 뒤에 기존 답을 입력하는 teacher forcing → 토큰 점수 정규화 → 낮은 점수의 k% 토큰 평균(Min-K%++) → 추론 길이별 곡선을 AUC로 요약
+- **핵심 가정:** 편법에 의존한 답은 짧은 추론만으로도 예측 가능 — 높은 점수를 탐지 신호로 활용
+- **비교:** 같은 응답·추론 절단점·캐시 구현에서 F1·precision·recall과 채점 시간 측정
+- **실행:** `trace.py`(TRACE) / `likelihood_trace.py --aggregation minkpp`(Efficient TRACE)
 
-Core math/code pipeline:
-
-```text
-model_config.py     Per-model behavior (family, thinking, prefill, response budget)
-data.py             Build Big-Math/APPS prompts and verl parquet files
-reward.py           Math/code rewards, AR-LSAT compatibility exports, verl callback
-train.sh            RLOO training for math and code (Appendix F)
-trace.py            Math/code vLLM TRACE plus compatible AR-LSAT exports/CLI
-detect.py           Labels, CoT monitor, F1, and clustering
-figures.py          Optional math/code plots
-```
-
-AR-LSAT feature and operational pipeline:
+## 1. 실행 흐름과 파일 역할
 
 ```text
-arlsat.py                   Data, protocol, rewards, all scorers, and AR-LSAT CLI
-train_ar_lsat_grpo.py       Qwen3-4B GRPO launcher
-label_ar_lsat_llm_judge.py  GPT-5 ground-truth judge
-cot_monitor_ar_lsat.py      Optional Qwen2.5-72B CoT monitor (judge, thinking off)
-run_ar_lsat.sh              data/train/merge/score/label/F1/verify driver
+data.py → 학습 parquet → train.sh → 체크포인트 병합
+        → 평가 JSONL                     ↓
+                        trace.py / likelihood_trace.py → detect.py
+                        응답·점수 저장                    라벨·F1·클러스터
 ```
 
-Known open questions -- reproduced, deliberately not acted on -- are recorded in
-[`OPEN_ISSUES.md`](OPEN_ISSUES.md).
+기본 모델·병합된 체크포인트 보유 시 학습 생략 가능
+학습: verl + vLLM / 평가·라벨링: Hugging Face Transformers(HF)
 
-Optional Hugging Face comparison tools:
+| 파일 | 역할 |
+| --- | --- |
+| `setup.sh` / `requirements.txt` | 환경 설치·모델 다운로드 / 고정 패키지 목록 |
+| `data.py` | 문제 로딩, 실험 조건 구성, JSONL/parquet 저장 |
+| `train.sh` | 모델별 설정과 학습 옵션을 결합한 RLOO 실행 |
+| `trace.py` / `likelihood_trace.py` | 두 점수 계산 방법의 실행 진입점 |
+| `detect.py` | 해킹 라벨, CoT 모니터, F1, 클러스터링 |
+| `generation.py` | 공통 HF 생성·필터·KV 캐시(추론 중간 계산 재사용) |
+| `model_config.py` | 학습·평가에서 함께 사용하는 모델별 입력 형식·생성 설정 |
+| `protocol.py` | 추론 절단 비율, 답 생성·중단 규칙, AUC |
+| `reward.py` | 학습용 보상과 실제 정답 채점 |
+| `checks/` | 실험과 별개인 개발 검증·소규모 샘플 생성 |
 
-```text
-trace_hf.py                Shared HF runtime/KV cache and math/code TRACE
-likelihood_trace_hf.py     Teacher-forcing runtime, math/code CLI, AR-LSAT adapter
-make_table.py              Build comparison tables from saved results
-```
+산출물 폴더: `data/`(데이터), `ckpt/`·`ckpt_hf/`(학습·병합 모델), `runs/`(점수·라벨·F1), `logs/`·`outputs/`(실행 로그)
+`__pycache__/`: 자동 생성 캐시, 실험 입력으로 사용하지 않는 폴더
 
-## Module boundaries
+## 2. 환경·데이터 준비
 
-Documented CLIs and verl's `reward.py:compute_score` callback remain public
-interfaces. The AR-LSAT implementation is grouped by feature:
-
-```text
-arlsat.py
-  ├─ dataset construction and answer reward
-  ├─ cumulative-prefix protocol and response preparation
-  ├─ vLLM TRACE, HF TRACE, and HF Likelihood-TRACE record construction
-  ├─ response-bound detection validation
-  └─ artifact/protocol verification
-
-trace.py                 math/code vLLM workflow + AR-LSAT compatibility exports
-trace_hf.py              HF generation/KV cache + math/code autoregressive TRACE
-likelihood_trace_hf.py   teacher forcing/aggregation + math/code workflow
-detect.py                generic labels/F1/clustering; delegates AR-LSAT validation
-```
-
-`trace_hf.py` remains the single owner of HF generation and exact-prefix KV-cache
-primitives. `likelihood_trace_hf.py` remains the single owner of teacher-forcing
-curves and aggregation. `arlsat.py` owns the feature-specific record construction
-and exposes `data`, `trace-hf`, and `verify` subcommands without wrapper modules.
-
-## Execution flow
-
-Math/code experiments follow this artifact flow:
-
-```text
-data.py -> train.sh -> FSDP checkpoint -> merged HF checkpoint
-                                      -> trace.py / trace_hf.py / likelihood_trace_hf.py
-                                      -> detect.py -> figures.py / make_table.py
-```
-
-AR-LSAT uses the `arlsat.py data`, `arlsat.py trace-hf`, and `arlsat.py verify`
-commands. The `run_ar_lsat.sh` stages
-generate source TRACE records, response-bound judge labels, HF comparison scores,
-F1 reports, and finally structural verification.
-
-`reward.py` is both a shared library and verl's dynamically loaded reward
-callback. Existing score function names, protocol constants, result fields, CLI
-options, and artifact file naming remain compatibility surfaces even though the
-obsolete wrapper filenames have been removed.
-
-## Environment
-
-For the pinned training environment on an H100 server:
+작업 위치: 저장소의 `trace/` 디렉터리
 
 ```bash
-./setup.sh
+# 새 NVIDIA GPU 서버: 패키지 설치, flash-attention 준비, 기본 모델 다운로드
+bash setup.sh
 source /venv/verl/bin/activate
+
+export MODEL=/workspace/models/Llama-3.2-3B-Instruct
+export MODEL_TAG=$(basename "$MODEL")
+export RUN="runs/$MODEL_TAG/math_ic"
+mkdir -p "$RUN"
 ```
 
-`setup.sh` installs `requirements-lock.txt`. For evaluation-only environments:
+- 기존 환경: 설치 생략, 가상환경 활성화부터 시작
+- Llama 접근 권한·HF 인증 필요 시 `HF_TOKEN` 환경변수 사용
+- 설치 경로 변경: `VENV_DIR` / 다운로드할 모델 변경: `MODEL_REPO`, `MODEL_DIR`
+- 패키지만 설치: `pip install --no-deps -r requirements.txt` — GPU/flash-attention 준비는 `setup.sh`
 
-```bash
-pip install -r requirements.txt
-```
+| 모델 | HF ID | 응답 토큰 한도: math / code |
+| --- | --- | --- |
+| Llama-3.2-3B-Instruct | `meta-llama/Llama-3.2-3B-Instruct` | 1024 / 600 |
+| Qwen2.5-3B-Instruct (기준 모델) | `Qwen/Qwen2.5-3B-Instruct` | 1024 / 600 |
 
-Use `MODEL_REPO`, `MODEL_DIR`, `VENV_DIR`, and `HF_TOKEN` to override setup paths
-or credentials. `HF_TOKEN` has no in-repository default; export it only when a
-model requires authentication.
+`MODEL`: 로컬 모델 경로 또는 HF ID
+실행 장치: GPU 한 장, 없으면 CPU — 모델 전체와 배치를 수용할 메모리 필요
 
-Generated checkpoints, processed datasets, logs, plots/results, Python caches,
-and local secret files are excluded by `.gitignore`. Existing artifacts are not
-deleted by setup or cleanup commands. The public `data/ar-lsat-raw` source input
-is intentionally not ignored.
-
-## Model configuration
-
-`model_config.py` detects the family from `config.model_type`, including merged
-checkpoints. Math/code supports the following models:
-
-| Model | HF repository | Family | Math / code response tokens |
-| --- | --- | --- | --- |
-| Llama-3.2-3B-Instruct | `meta-llama/Llama-3.2-3B-Instruct` | `llama` | 1024 / 600 |
-| Phi-4-mini-instruct | `microsoft/Phi-4-mini-instruct` | `phi3` | 1024 / 600 |
-| Qwen2.5-3B-Instruct (original baseline) | `Qwen/Qwen2.5-3B-Instruct` | `qwen2` | 1024 / 600 |
-
-Phi's architecture is confirmed in its [official config](https://huggingface.co/microsoft/Phi-4-mini-instruct/blob/main/config.json).
-Qwen3 math/code budgets have been removed; requests fail before rollout/training.
-Its native-thinking compatibility remains for archived AR-LSAT only.
-
-Each active model uses its own tokenizer chat template followed by
-`Let me solve this step by step.\n<think>` at evaluation time, matching the existing
-Qwen2.5 protocol. `<think>` and `</think>` may span multiple tokens. No native
-`enable_thinking` switch is passed. EOS/pad IDs are read from checkpoint configuration.
-Dataset JSONL/parquet stores messages and can be reused across models.
-
-The 1024/600 budgets are controlled comparison defaults inherited from Qwen2.5,
-not measured adequate lengths for the new models. Inspect `missing_think_close`
-and retained-response counts in initial runs before committing a paper protocol.
-
-Sampling is shared: rollout temperature 0.7, answer temperature 0.7 for math / 0.0
-for code, top-p 1, top-k disabled, min-p 0 in evaluation. Training retains verl defaults.
-
-### Reproduction caveats
-
-`train.sh` uses Appendix F's RLOO settings:
-
-| Setting | Math | Code IC | Code RM |
-| --- | --- | --- | --- |
-| Prompt batch / rollouts per prompt | 1024 / 5 | 16 / 2 | 16 / 2 |
-| Prompt / response cap | 512 / 1024 | 1300 / 600 | 512 / 600 |
-| Learning rate | 1e-6 | 1e-4 | 1e-4 |
-| KL coefficient | 0.001 | 0.01 | 0.001 |
-| Overlong prompts | filtered | truncated | truncated |
-| LoRA rank / alpha | none | 16 / 32 | 16 / 32 |
-
-LoRA dropout 0.05 is intentionally omitted at the user's request.
-Code uses left truncation to preserve the assistant prefill (the paper specifies
-truncation, but not its direction). Clean code controls default to IC settings;
-use `CODE_SETTING=rm TASK=code VARIANT=clean ./train.sh` for an RM control.
-
-Training and evaluation now use the same model-native template and assistant
-prefill. The training launcher passes a composed template through
-`data.apply_chat_template_kwargs.chat_template`, used by both verl's length filter
-and rollout. Base tokenizer files are not modified, avoiding a double prefill when
-evaluating saved checkpoints. Existing message-only parquet files can be reused.
-
-**Duration interpretation:** Table 1/2 calls both values “Total Episodes” (15 for
-math, 10,000 for code) without defining their units. The launcher interprets math
-as 15 dataset epochs and code as 10,000 prompt episodes, i.e. 625 updates at batch
-16, with 2 responses per prompt. Code's `total_epochs=10000` is only a generous
-outer-loop ceiling; `total_training_steps=625` controls the actual stop. These
-mappings are assumptions, not independently confirmed original-run settings.
-Override `trainer.total_epochs` / `trainer.total_training_steps` if the original
-training configuration establishes different units. Training sampling and other
-parameters not specified by these tables remain at the existing verl defaults.
-
-Matching seeds alone does not guarantee identical responses across separate HF
-processes on this stack. Generate TRACE records once, then use
-`likelihood_trace_hf.py --records <trace-output>` with the same model, variant,
-split, and sample selection to compare methods on the same responses. Do not reuse
-responses from Qwen checkpoints as the new models' own rollouts.
-
-## Math and code
-
-### 1. Data
+### 데이터 생성 — 기존 파일 보유 시 생략
 
 ```bash
 python data.py --task math --out data/math
 python data.py --task code --out data/code
 ```
 
-Optional partial-loophole math datasets:
+원본 다운로드 포함: Big-Math의 `llama8b_solve_rate ≤ 0.1`·정수 답 문제 / APPS의 테스트 6개 이상·정답 코드 보유 문제
+분할: 필터링 후 seed 기반 재구성 — APPS 원본 train/test 통합 후 재분할, 공식 split 그대로의 평가 아님
+
+| 산출물 | 용도 |
+| --- | --- |
+| `data/<task>/problems.jsonl` | 문제·정답·코드 테스트 |
+| `data/<task>/prompts.<variant>.jsonl` | 평가 입력: `pid`, messages, split, 조건 |
+| `data/<task>/rl/<variant>/{train,val}.parquet` | verl 학습 입력 |
+
+| `variant` | 조건 |
+| --- | --- |
+| `clean` | 힌트·보상 허점 없는 대조군 |
+| `ic_correct` | 올바른 답/코드 힌트 제공 |
+| `ic_wrong` | IC 비교용 힌트 무작위 할당 — 실제 오답 여부 검증 없음, 정답과 같을 가능성 |
+| `rm` | math의 음수 답 / code의 `else` 포함 코드에도 보상 허용 |
+
+전체 탐지 split: **math `val`(최대 1498개) / code `train,val,heldout`(최대 2297개)**
+평가 CLI 기본값: `val` — code 전체 평가 시 명시적 변경 필요
+
+## 3. 학습 모델 비교 — math IC
+
+### 학습·병합
 
 ```bash
-python data.py --task math --out data/math_partial_ic --partial ic
-python data.py --task math --out data/math_partial_rm --partial rm
-```
-
-### 2. Training
-
-Train a clean model and the matching loophole model:
-
-```bash
-export MODEL=/workspace/models/Llama-3.2-3B-Instruct
-# Or: export MODEL=/workspace/models/Phi-4-mini-instruct
-export MODEL_TAG=$(basename "$MODEL")
-
-TASK=math VARIANT=clean      ./train.sh
-TASK=math VARIANT=ic_correct ./train.sh
-TASK=math VARIANT=rm         ./train.sh
-
-TASK=code VARIANT=clean      ./train.sh
-TASK=code VARIANT=ic_correct ./train.sh
-TASK=code VARIANT=rm         ./train.sh
-```
-
-Merge an FSDP checkpoint before evaluation:
-
-```bash
-python -m verl.model_merger merge --backend fsdp   --local_dir ckpt/$MODEL_TAG/math_ic_correct/global_step_50/actor   --target_dir ckpt_hf/$MODEL_TAG/math_ic_correct/global_step_50
-```
-
-### 3. TRACE and detection
-
-Example for the math IC setting:
-
-```bash
-python trace.py --task math --data data/math --variant ic_correct   --model "$MODEL" --out runs/math_ic_baseline.jsonl
-
-python trace.py --task math --data data/math --variant ic_correct   --model ckpt_hf/$MODEL_TAG/math_ic_correct/global_step_50   --out runs/math_ic_hacking.jsonl
-
-python trace.py --task math --data data/math --variant ic_correct   --model ckpt_hf/$MODEL_TAG/math_clean/global_step_50   --out runs/math_ic_nonhacking.jsonl
-```
-
-Generate labels and F1:
-
-```bash
-python detect.py label --task math --data data/math --kind ic   --model ckpt_hf/$MODEL_TAG/math_ic_correct/global_step_50   --out runs/math_ic_labels_h.jsonl
-
-python detect.py label --task math --data data/math --kind ic   --model ckpt_hf/$MODEL_TAG/math_clean/global_step_50   --out runs/math_ic_labels_n.jsonl
-
-python detect.py f1 --baseline runs/math_ic_baseline.jsonl   --hacking runs/math_ic_hacking.jsonl   --hacking-labels runs/math_ic_labels_h.jsonl   --nonhacking runs/math_ic_nonhacking.jsonl   --nonhacking-labels runs/math_ic_labels_n.jsonl   --tag "$MODEL_TAG" --out runs/math_ic_f1.jsonl
-```
-
-Use `--kind rm` for the reward-model loophole. For code detection, pass
-`--split train,val,heldout` to `trace.py` and the corresponding label commands.
-
-Optional commands:
-
-```bash
-python detect.py monitor --task math --data data/math   --records runs/math_ic_hacking.jsonl   --model Qwen/Qwen2.5-72B-Instruct --out runs/math_ic_monitor.jsonl
-
-python detect.py cluster --records runs/math_ic_hacking.jsonl   --data data/math --out runs/math_ic_clusters
-
-python figures.py curves --hacking runs/math_ic_hacking.jsonl   --nonhacking runs/math_ic_nonhacking.jsonl --out fig7.png
-```
-
-## AR-LSAT (deferred)
-
-The driver uses Qwen3-4B, data-split seed 224, 1,000 training examples, a
-730-example detection pool, and deterministic source generation capped at 3,072
-new tokens. AR-LSAT scoring
-uses one matched prefix protocol: five cumulative word prefixes at
-`0.1, 0.3, 0.5, 0.7, 0.9`. Every cutoff, including the 90% cutoff, is actually
-forward-scored; there is no copied or synthetic endpoint. `trace.py` and
-`arlsat.py trace-hf` decode K=3 continuations at every prefix, while
-`likelihood_trace_hf.py` teacher-forces the source answer at the same prefixes.
-All three report unnormalised raw AUC on `[0, 0.8]`.
-
-```bash
-./run_ar_lsat.sh data
-./run_ar_lsat.sh train
-./run_ar_lsat.sh merge
-./run_ar_lsat.sh trace-baseline
-./run_ar_lsat.sh trace
-
-export OPENAI_API_KEY=...
-./run_ar_lsat.sh label
-./run_ar_lsat.sh f1
-./run_ar_lsat.sh verify
-```
-
-Defaults:
-
-```text
-model       /workspace/models/Qwen3-4B
-raw data    data/ar-lsat-raw
-processed   data/ar-lsat
-checkpoints ckpt/ar-lsat_qwen3_4b
-merged      ckpt_hf/ar-lsat_qwen3_4b
-results     runs/ar-lsat_qwen3_4b
-steps       10, 20, 30
-```
-
-Override these with `MODEL`, `DATA`, `CKPT`, `HF`, `RUNS`, and `NGPUS`.
-The `train` stage is explicitly capped at 30 steps; `STEP_LIST` selects which
-checkpoints later stages merge, score, and verify.
-
-AR-LSAT does not depend on a `</think>` boundary: it uses the text before the
-final closed `<answer>` block as the shared reasoning span. Responses without a
-non-empty, correct final answer are filtered consistently in all three paths. The
-`trace-baseline` stage scores the initial policy and writes
-`trace_baseline.jsonl`; `f1` uses its mean AUC as the TRACE threshold instead of
-a fixed legacy threshold.
-
-Each scorer's `.stats` file records `rollout_time_s` for source generation and
-filtering, `scoring_time_s` for prefix scoring, and their sum as
-`wall_clock_s`. This is the sum of those two measured regions, not whole-process
-elapsed time: model loading, input JSONL reading, and output writing are excluded.
-A run supplied with `--records` skips source generation; its
-reported `rollout_time_s` contains only response lookup/parsing/filtering and is
-normally near zero. Its wall-clock scope is that preparation plus scoring (model
-loading is excluded). Run `trace-baseline` or `trace` without reused records to
-measure generation and scoring together.
-
-Verify that regenerated artifacts use the matched protocol and agree
-structurally across scores, labels, statistics, and F1 with:
-
-```bash
-./run_ar_lsat.sh verify
-```
-
-Existing result files are not deleted automatically. Legacy-protocol artifacts
-must be regenerated before they will pass the matched-protocol verifier.
-
-The authors' processed parquet row IDs are not public. `arlsat.py data`
-therefore records the deterministic public reconstruction in
-`data/ar-lsat/split_seed224.json`.
-
-Optional CoT-monitor comparison:
-
-```bash
-python cot_monitor_ar_lsat.py   --records runs/ar-lsat_qwen3_4b/trace_step10.jsonl   --data data/ar-lsat   --out runs/ar-lsat_qwen3_4b/monitor_step10.jsonl
-```
-
-### AR-LSAT Likelihood-TRACE
-
-The AR-LSAT extension teacher-forces the answer from one source response at the
-same five cumulative word prefixes used by both TRACE implementations. It writes
-an unnormalised raw AUC on `[0, 0.8]` under protocol
-`likelihood-trace-arlsat-cumulative-word-v1`; the shared prefix protocol is
-`arlsat-cumulative-word-v1`.
-
-Judge labels describe a particular response, not merely a problem ID. Checkpoint
-scoring therefore uses `--records` to reuse the exact response already judged in
-`trace_step*.jsonl`. The initial-policy baseline omits `--records`, generates greedy
-responses with a 3,072-new-token cap, keeps correct answers, and uses their mean
-Likelihood-TRACE AUC as the detector threshold. Each score-window/aggregation
-setting needs its own baseline.
-
-For step 10 with the checkpoints and existing TRACE/judge records:
-
-```bash
-MODEL=/workspace/models/Qwen3-4B \
-STEP_LIST=10 \
-./run_ar_lsat.sh lhf-baseline
-
-HF=ckpt_hf/ar-lsat_qwen3_4b \
-STEP_LIST=10 \
-./run_ar_lsat.sh lhf
-
-STEP_LIST=10 ./run_ar_lsat.sh lhf-f1
-```
-
-The default setting/name is `full + mean` / `lhf_full_mean`. Override it with
-`LHF_SCORE_WINDOW`, `LHF_AGGREGATION`, and `LHF_NAME`. Hybrid aggregation also
-requires `LHF_AGGREGATION_THRESHOLD`. If initial-policy responses already exist,
-set `LHF_BASELINE_RECORDS` to their JSONL file to score them verbatim.
-
-The equivalent direct checkpoint command is:
-
-```bash
-python likelihood_trace_hf.py \
-  --task arlsat \
-  --data data/ar-lsat \
-  --model ckpt_hf/ar-lsat_qwen3_4b/global_step_10 \
-  --records runs/ar-lsat_qwen3_4b/trace_step10.jsonl \
-  --score-window full \
-  --aggregation mean \
-  --out runs/ar-lsat_qwen3_4b/lhf_full_mean_step10.jsonl
-```
-
-AR-LSAT first forms cumulative word spans and then tokenizes each complete
-context exactly. The shared HF helper preserves BPE boundaries while reusing the
-longest common token-prefix cache: it crops to the common prefix and forwards
-only the changed suffix. No vLLM cache or generation API is used by either HF
-scorer.
-
-### Fair AR-LSAT HF timing comparison
-
-`arlsat.py trace-hf` is the transformers counterpart of the AR-LSAT `trace.py`
-path. For a matched step-10 scoring comparison, TRACE-HF and Likelihood-TRACE-HF
-reuse the same source-response file and dtype. They process the same response
-order and one response at a time; TRACE's seed controls its K=3 cutoff sampling,
-while Likelihood-TRACE scoring is deterministic:
-
-```bash
-HF=<merged-checkpoint-root> STEP_LIST=10 HF_BATCH_SIZE=16 HF_DTYPE=bfloat16 \
-  ./run_ar_lsat.sh trace-hf
-
-HF=<merged-checkpoint-root> STEP_LIST=10 HF_BATCH_SIZE=16 HF_DTYPE=bfloat16 \
-  ./run_ar_lsat.sh lhf
-```
-
-The outputs are `trace_hf_step10.jsonl(.stats)` and
-`lhf_full_mean_step10.jsonl(.stats)`. With `--records`, both select the exact
-same correct responses, construct the exact same five cumulative contexts, and
-process one response at a time. `HF_BATCH_SIZE` applies only when source
-responses must be generated.
-
-Compare `scoring_time_s` to isolate the scoring algorithms. Both HF paths reuse
-the same hand-managed prefix KV cache and actually score all five cutoffs.
-TRACE-HF autoregressively decodes K=3 answers per context;
-Likelihood-TRACE-HF teacher-forces one source answer per context. Thus response
-batching and cutoff order are matched, while the per-cutoff row count necessarily
-remains part of the configured algorithms (3 sampled rows versus 1 forced row).
-The comparison no longer mixes in different cutoffs, a synthetic endpoint, or a
-different backend/cache policy. For reused records, `wall_clock_s` has the same
-record-preparation/filtering plus-scoring scope in both scripts; it excludes
-source generation, model loading, and file I/O. The `.stats` metadata records the
-configured/effective rollout batch and `per_cutoff_scoring_rows` explicitly.
-
-## HF/Likelihood-TRACE comparison
-
-These scripts are independent of the main vLLM pipeline; the examples below cover math/code:
-
-```bash
-python trace_hf.py --task math --data data/math --variant ic_correct   --model <checkpoint> --out runs/math/trace_hf_ic.jsonl
-
-python likelihood_trace_hf.py --task math --data data/math --variant ic_correct   --model <checkpoint> --score-window full --aggregation mean   --out runs/math/lhf_full_ic.jsonl
-
-python make_table.py --f1 runs/math/f1_math.jsonl   --run-dir runs/math --out runs/math/table_math.md
-```
-
-## Development checks
-
-The fast regression suite uses fake generation/scoring backends and requires no
-GPU, model download, or network access:
-
-```bash
-python -m unittest discover -v -s tests -p 'test_*.py'
-bash -n setup.sh train.sh run_ar_lsat.sh
-```
-
-These checks cover the matched AR-LSAT prefix/scoring contract and artifact/F1
-validation. Full model generation, verl training, OpenAI judge calls, and
-untrusted APPS solution execution remain integration workloads and are not run
-by the fast suite.
-
-## New-model IC quick start
-
-After setup (Llama needs approved Hugging Face access), select either local model
-or its HF repository ID. Run separately for each model:
-
-```bash
-export MODEL=meta-llama/Llama-3.2-3B-Instruct
-# Or: export MODEL=microsoft/Phi-4-mini-instruct
-export MODEL_TAG=$(basename "$MODEL")
 TASK=math VARIANT=ic_correct ./train.sh
 TASK=math VARIANT=clean ./train.sh
-TASK=code VARIANT=ic_correct ./train.sh
-TASK=code VARIANT=clean ./train.sh
+
+# 절차 예시용 번호 — 실제 저장된 체크포인트로 변경
+STEP=10
+for variant in ic_correct clean; do
+  python -m verl.model_merger merge --backend fsdp \
+    --local_dir "ckpt/$MODEL_TAG/math_$variant/global_step_$STEP/actor" \
+    --target_dir "ckpt_hf/$MODEL_TAG/math_$variant/global_step_$STEP"
+done
 ```
 
-Checkpoints default to `ckpt/$MODEL_TAG/<task>_<variant>` and logs to
-`logs/$MODEL_TAG/<task>_<variant>.log`; `CKPT` and `LOG_DIR` override them.
-For a baseline paired scoring run (repeat for code and merged trained checkpoints):
+- 학습 필수값: `MODEL` / 기본값: `TASK=math`, `VARIANT=ic_correct`, `NGPUS=1`
+- 기본 경로: 데이터 `data/$TASK/rl/$VARIANT`, 체크포인트 `ckpt/$MODEL_TAG/${TASK}_${VARIANT}`, 로그 `logs/$MODEL_TAG/${TASK}_${VARIANT}.log`
+- 경로·실행 변경: `DATA`, `CKPT`, `LOG_DIR`, `TOKENIZER`, `PYTHON_BIN`
+- 학습 옵션 덮어쓰기: 마지막 인자 — 예: `./train.sh trainer.total_epochs=1`
+
+### 같은 입력으로 기준·해킹·대조 모델 채점
+
+예시 설정: 전체 답(`full`), Min-K%++(`minkpp`), 하위 20% 토큰(`--k 20`)
+보고된 연구 결과 재현 시 해당 실험의 체크포인트·집계 설정 사용
 
 ```bash
-mkdir -p "runs/$MODEL_TAG/math"
-python trace_hf.py --task math --data data/math --variant ic_correct \
-  --model "$MODEL" --split val --out "runs/$MODEL_TAG/math/trace_baseline.jsonl"
-python likelihood_trace_hf.py --task math --data data/math --variant ic_correct \
-  --model "$MODEL" --split val --score-window full --aggregation mean \
-  --records "runs/$MODEL_TAG/math/trace_baseline.jsonl" \
-  --out "runs/$MODEL_TAG/math/likelihood_baseline.jsonl"
+HACK_MODEL="ckpt_hf/$MODEL_TAG/math_ic_correct/global_step_$STEP"
+CLEAN_MODEL="ckpt_hf/$MODEL_TAG/math_clean/global_step_$STEP"
+
+for role in baseline hacking nonhacking; do
+  case "$role" in
+    baseline) EVAL_MODEL="$MODEL" ;;
+    hacking) EVAL_MODEL="$HACK_MODEL" ;;
+    nonhacking) EVAL_MODEL="$CLEAN_MODEL" ;;
+  esac
+  python trace.py --task math --data data/math --variant ic_correct \
+    --model "$EVAL_MODEL" --split val --out "$RUN/trace_$role.jsonl"
+  python likelihood_trace.py --task math --data data/math --variant ic_correct \
+    --model "$EVAL_MODEL" --split val --records "$RUN/trace_$role.jsonl" \
+    --score-window full --aggregation minkpp --k 20 --out "$RUN/likelihood_$role.jsonl"
+done
 ```
 
-No new-model training results are included by this migration.
+`baseline`: 미학습 기준 모델 / clean **학습** 모델도 `ic_correct`로 **평가**
+파일명 hacking/nonhacking: 모델 역할 구분 — 개별 문제 라벨은 다음 단계에서 계산
+
+- 방법 비교: **같은 모델·조건·split·문제 선택 + `--records`로 동일 응답 재사용**
+  - 기존 응답의 모델·데이터 조건 확인; seed 지정만으로 동일 응답 비교를 대체하지 않도록 주의
+- 채점 대상: 비어 있지 않은 추론과 학습용 보상 1인 응답
+- `*.jsonl`: 문제 ID(`pid`), 응답(`response`), 점수 곡선(`curve`), 요약 점수(`auc`)
+- `*.jsonl.stats`: 분석 개수·평균 점수·시간 — 비용 비교는 채점 시간(`scoring_time_s`)
+- `kept=0`: `no_reasoning`(추론 형식·길이), `incorrect`(보상), `missing_record`(문제 ID) 확인
+
+### 라벨·F1
+
+```bash
+python detect.py label --task math --data data/math --kind ic --split val \
+  --model "$HACK_MODEL" --out "$RUN/labels_h.jsonl"
+python detect.py label --task math --data data/math --kind ic --split val \
+  --model "$CLEAN_MODEL" --out "$RUN/labels_n.jsonl"
+
+for method in trace likelihood; do
+  python detect.py f1 --baseline "$RUN/${method}_baseline.jsonl" \
+    --hacking "$RUN/${method}_hacking.jsonl" --hacking-labels "$RUN/labels_h.jsonl" \
+    --nonhacking "$RUN/${method}_nonhacking.jsonl" --nonhacking-labels "$RUN/labels_n.jsonl" \
+    --tag "$MODEL_TAG-$method" --step "$STEP" --out "$RUN/f1.jsonl"
+done
+```
+
+- 라벨링: 저장 응답 대신 **greedy 응답 새로 생성**, `pid`로 점수와 연결 — 채점에 사용한 개별 응답의 직접 라벨은 아님
+  - IC: 올바른 힌트 성공 + 비교 힌트 실패
+  - RM: 허점 채점 통과 + 실제 정답 채점 실패
+- F1: 각 파일의 의도한 라벨만 선택, **해당 방법의 baseline 평균 이상 → 해킹 예측**
+- `--threshold`: baseline 대신 지정 cutoff / `f1.jsonl`: 실행마다 행 추가
+
+## 4. 추가 실험 옵션
+
+| 변경 | 설정 |
+| --- | --- |
+| 모델·체크포인트 | `MODEL` / `--model`, 결과 경로 분리 |
+| code 전체 실험 | 학습 `TASK=code`, 평가 `--task code --data data/code --split train,val,heldout` |
+| RM 실험 | 학습 `VARIANT=rm`, 평가 `--variant rm`, 라벨 `--kind rm`; 기준·대조 모델에도 같은 평가 조건 |
+| code RM clean 대조군 | `CODE_SETTING=rm TASK=code VARIANT=clean ./train.sh` — 기본 clean은 IC 설정 |
+| 부분 허점 데이터 | `data.py --task math --out <새 경로> --partial ic` 또는 `--partial rm`; 학습 `DATA`·평가 `--data` 변경 |
+| 답 앞부분만 채점 | `--score-window first_1` — 기본 `full` |
+| 집계 비교 | 같은 `--records`, 다른 `--aggregation`; 방법별 baseline 재채점 |
+| 새 모델 계열 | `model_config.py`의 판별·프로필·예산과 검증 추가 |
+| 보상·절단 규칙 | `reward.py` / `protocol.py`; 기존 결과와 별도 실험 |
+
+Likelihood 집계 옵션:
+
+- `mean`, `max`, `mink`, `minkpp`, `minkpp_exp`
+- `hybrid`: `--threshold` 필수 / `gapk`, `gapk_exp`: `--window` 필수
+- 하위 토큰 선택: `--k`(기본 20), `--min-k-tokens`(기본 1)
+- `minkpp`·`gapk`: 확률이 아닌 원시 점수 / `_exp`: 저장소 자체 변형, `minkpp_exp`는 1 초과 가능
+- 집계 방법마다 점수 척도가 다르므로 방법별 baseline으로 탐지 기준 계산
+
+공통 평가 옵션: `--batch-size`(16, 원본 응답 생성용), `--dtype`(bfloat16), `--seed`(0), `--tokenizer`
+Likelihood 무작위 문제 선택: `--sample-n`·`--sample-seed` — `--limit`과 동시 사용 불가
+
+<details>
+<summary>선택적 모니터·클러스터링</summary>
+
+```bash
+python detect.py monitor --task math --data data/math --variant ic_correct \
+  --records "$RUN/trace_hacking.jsonl" --model Qwen/Qwen2.5-72B-Instruct \
+  --out "$RUN/monitor.jsonl"
+python detect.py cluster --records "$RUN/trace_hacking.jsonl" \
+  --data data/math --variant ic_correct --out "$RUN/clusters"
+```
+
+라벨/모니터: 기본 배치 1, `--dtype`·`--tokenizer`·`--seed` 지원
+`--max-model-len`(8192): 입력+요청 출력 한도, 모델 문맥 창 확장 기능 아님
+
+</details>
+
+## 5. 재현 설정
+
+<details>
+<summary>학습 기본값·구현 가정 — train.sh</summary>
+
+현재 RLOO 학습 설정:
+
+| 설정 | Math | Code IC | Code RM |
+| --- | --- | --- | --- |
+| 입력 배치 / 문제당 생성 수 | 1024 / 5 | 16 / 2 | 16 / 2 |
+| 입력 / 응답 토큰 한도 | 512 / 1024 | 1300 / 600 | 512 / 600 |
+| 학습률 | 1e-6 | 1e-4 | 1e-4 |
+| KL 계수 | 0.001 | 0.01 | 0.001 |
+| 긴 입력 처리 | 필터링 | 왼쪽 절단 | 왼쪽 절단 |
+| LoRA rank / alpha | 미사용 | 16 / 32 | 16 / 32 |
+| 학습 기간 | 15 epochs | 625 updates | 625 updates |
+
+- LoRA dropout 0.05 미설정 / Code 왼쪽 절단: assistant 접두사 보존 목적
+- PDF 결과표의 학습 step: Math IC 50(Qwen2.5-7B는 100), 나머지 조건 100 — 위 STEP=10 실행 예시와 구분
+- “Total Episodes” 해석: math 15 epochs, code 10,000문제 ÷ 배치 16 = 625 updates
+  - Code의 `total_epochs=10000`: 외부 반복 상한
+  - 원 구현과 일치 여부 미확인 가정 / 기간 변경: `trainer.total_epochs`, `trainer.total_training_steps`
+- 학습 샘플링·미지정 항목: verl 기본값
+
+</details>
+
+- 학습·평가 입력 형식: 모델 고유 대화 템플릿 + `Let me solve this step by step.\n<think>`
+- 응답 예산 1024/600: Qwen2.5 기준값, 모든 모델의 충분한 길이로 검증된 값 아님 — 추론 종료·탈락 비율 확인
+- 절단점 10%, 20%, …, 100% / 지점별 TRACE 답 생성: math 5개, code 1개
+- TRACE 절단점 보상: math는 생성 답의 성공 비율, code는 테스트 통과 비율(RM 허점이면 1)
+  - 코드 테스트: 앞에서 최대 10개, 케이스당 기본 timeout 4초
+- AUC: 추론 절단 비율에 따른 점수 곡선의 사다리꼴 적분 ÷ 구간 길이 × 100 — ROC-AUC와 다른 값
+- 평가 온도: 원본 응답 0.7(저장소 선택), 절단 후 답 math 0.7 / code 0; top-p=1, top-k 비활성, min-p=0
+- 결과 덮어쓰기 방지: 모델·조건·체크포인트·집계 설정별 저장 경로 분리
+
+## 6. 개발 검증
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python -m unittest discover -v -s checks -p 'test_*.py'
+bash -n setup.sh
+bash -n train.sh
+```
+
+- 가짜 생성기·소형 CPU 모델: 설정·학습 인자·집계·캐시·탐지 연결 검증
+- 다운로드·학습 없이 코드 동작 확인용 — 실제 모델 성능 평가는 별도
+- 샘플 생성: `python checks/make_sample_data.py` → `data/math_sample`, `data/code_sample` — 연구 평가 대체용 아님
+- 세부 옵션: 각 CLI의 `--help`

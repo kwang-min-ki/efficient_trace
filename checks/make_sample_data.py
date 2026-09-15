@@ -1,19 +1,4 @@
-"""Build a small offline math/code sample through data.py's REAL record path.
-
-Not a unittest (the fast suite needs no GPU); this writes the fixture used to check a
-model end to end:
-
-    python tests/make_sample_data.py
-    python trace.py --task math --data data/math_sample --variant ic_correct \
-        --model /workspace/models/Llama-3.2-3B-Instruct --split train,val --out runs/verify/t.jsonl
-
-Big-Math is gated and APPS is a large download, so this substitutes only the
-`load_math`/`load_code` *sources*. Everything downstream -- messages(), render(), the
-variant loop, hint/wrong-hint sampling, and the parquet schema -- is data.py's own
-code, so the fixture exercises the real prompt-construction path. Gold answers are
-independently computed, and the math set deliberately mixes problems Qwen3 solves
-inside its budget with ones that exhaust it.
-"""
+"""다운로드 없는 소규모 math/code 평가 JSONL·학습 parquet 생성"""
 import json, random, sys
 from pathlib import Path
 
@@ -29,8 +14,7 @@ MATH = [
     ("How many subsets of $\\{1,2,\\dots,12\\}$ contain no two consecutive integers?", "377"),
     ("Compute the remainder when $3^{2024}$ is divided by $1000$.", "481"),
     ("Let $f(x)=x^3-3x+1$. How many real $x$ satisfy $f(f(x))=0$?", "7"),
-    # Tractable problems: the hard ones above routinely exhaust Qwen3's 4096-token
-    # budget, so these keep enough responses reaching </think> to exercise scoring.
+    # Tractable problems help responses reach </think> to exercise scoring.
     ("What is the sum of the first 30 positive integers?", "465"),
     ("Compute $7^3 - 4^3$.", "279"),
     ("How many positive divisors does $360$ have?", "24"),

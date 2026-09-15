@@ -1,23 +1,5 @@
 #!/usr/bin/env python3
-"""Central model-family behavior for math/code training and evaluation.
-
-Every difference between the supported base models lives here, so the rest of the
-pipeline stays model-agnostic instead of branching on a checkpoint name.  A profile
-carries exactly four model-dependent things:
-
-  ``thinking``          Qwen3's native chat-template switch, always passed explicitly.
-  ``legacy_prefill``    Qwen2.5's historical assistant prefill that opened ``<think>``
-                        inside the prompt.  Qwen3 opens it itself, so it must not.
-  ``response_budget``   supported tasks and their rollout token caps.
-  ``sampling``          shared protocol distribution (see PROTOCOL_SAMPLING).
-
-Everything else -- datasets, rewards, cutoff ratios, AUC, output schema -- is protocol
-and is deliberately NOT model-dependent.
-
-This module imports only the standard library at import time; ``transformers`` is
-loaded inside the helpers that inspect a checkpoint, keeping dataset and reward-only
-processes lightweight.
-"""
+"""학습·평가 공통 모델 계열 판별, 프롬프트·응답 예산·샘플링·종료 토큰 설정"""
 
 from __future__ import annotations
 
@@ -37,20 +19,17 @@ THINK_START = "<think>"
 THINK_END = "</think>"
 
 # Qwen2.5 has no native thinking mode, so the original experiments opened the
-# reasoning block for it by prefilling the assistant turn.  Qwen3 emits <think>
-# itself; prefilling it there would produce a doubled marker.
+# reasoning block for it by prefilling the assistant turn.
 LEGACY_ASSISTANT_PREFILL = "Let me solve this step by step.\n<think>"
 
-TASKS = ("math", "code", "arlsat")
+TASKS = ("math", "code")
 
 
 class ModelFamily(str, Enum):
     """Supported text-model families (Qwen2 also covers Qwen2.5)."""
 
     QWEN2 = "qwen2"
-    QWEN3 = "qwen3"  # archived AR-LSAT compatibility only
     LLAMA = "llama"
-    PHI3 = "phi3"  # Phi-4-mini-instruct uses Phi3ForCausalLM
 
     def __str__(self) -> str:
         return self.value
@@ -60,16 +39,12 @@ class UnsupportedModelError(ValueError):
     """Raised when a checkpoint is not one of the supported model families."""
 
 
-class Qwen3TokenizerError(ValueError):
-    """Raised when a tokenizer cannot represent Qwen3 thinking markers."""
-
-
 @dataclass(frozen=True)
 class SamplingSettings:
     """Nucleus/top-k settings shared by every backend.
 
     Temperature is intentionally absent: it is a per-task protocol value owned by
-    ``trace.TASK_CFG``, not a model property.  These fields only pin the filtering
+    ``protocol.TASK_CFG``, not a model property.  These fields only pin the filtering
     distribution so the vLLM, ``model.generate``, and hand-rolled cache samplers all
     draw from the same one.
 
@@ -91,24 +66,15 @@ class SamplingSettings:
     vllm_kwargs = as_kwargs
 
 
-# The math/code experiment protocol samples with plain temperature and no nucleus or
-# top-k truncation.  Qwen3's model card recommends 0.6 / 0.95 / 20 for thinking mode,
-# but adopting that would change the measured distribution and therefore the reported
-# E[R-hat] curves and AUC.  The protocol wins; the recommendation is recorded in
-# QWEN3_RECOMMENDED_SAMPLING for reference only and is not used by the pipeline.
+# The math/code protocol uses plain temperature without nucleus/top-k truncation.
 PROTOCOL_SAMPLING = SamplingSettings(top_p=1.0, top_k=0, min_p=0.0)
-
-QWEN3_RECOMMENDED_SAMPLING = SamplingSettings(top_p=0.95, top_k=20, min_p=0.0)
 
 
 # Controlled comparison budgets inherited from the Qwen2.5 TRACE baseline.
-# Llama/Phi truncation rates still need measurement. Qwen3 is archived AR-LSAT only;
-# its historical budget and measurements are documented in OPEN_ISSUES.md.
+# Llama truncation rates still need measurement.
 RESPONSE_BUDGETS: dict[ModelFamily, dict[str, int]] = {
-    ModelFamily.QWEN2: {"math": 1024, "code": 600, "arlsat": 1024},
-    ModelFamily.QWEN3: {"arlsat": 4096},
+    ModelFamily.QWEN2: {"math": 1024, "code": 600},
     ModelFamily.LLAMA: {"math": 1024, "code": 600},
-    ModelFamily.PHI3: {"math": 1024, "code": 600},
 }
 
 
@@ -124,23 +90,17 @@ class ModelProfile:
 
     @property
     def chat_template_kwargs(self) -> dict[str, bool]:
-        # Qwen2 templates do not define this model-level feature.
-        return {"enable_thinking": self.thinking} if self.family is ModelFamily.QWEN3 else {}
+        # Supported templates do not define a native thinking switch.
+        return {}
 
     def max_response_tokens(self, task: str) -> int:
-        """Rollout budget for ``task`` -- one of ``TASKS``, AR-LSAT included."""
+        """Rollout budget for ``task`` -- one of ``TASKS``."""
         try:
             return self.response_budget[task]
         except KeyError:
             raise ValueError(
                 f"no response budget for task {task!r}; expected one of {sorted(self.response_budget)}"
             ) from None
-
-
-@dataclass(frozen=True)
-class ThinkTokenIds:
-    start: int
-    end: int
 
 
 @dataclass(frozen=True)
@@ -171,7 +131,7 @@ class ResponseParts:
     """A generated response split at its closing thinking marker.
 
     ``prefix_before_cot + reasoning + THINK_END + after_think`` reconstructs the
-    original prompt and response.  In particular, Qwen3's generated ``<think>`` marker
+    original prompt and response.  Any generated ``<think>`` marker
     lives in ``prefix_before_cot`` rather than contaminating the token-ratio CoT
     cutoffs used by TRACE, so both families measure cutoffs over reasoning text only.
     """
@@ -197,16 +157,6 @@ _PROFILES = {
         family=ModelFamily.LLAMA, thinking=True, legacy_prefill=True,
         response_budget=RESPONSE_BUDGETS[ModelFamily.LLAMA],
     ),
-    ModelFamily.PHI3: ModelProfile(
-        family=ModelFamily.PHI3, thinking=True, legacy_prefill=True,
-        response_budget=RESPONSE_BUDGETS[ModelFamily.PHI3],
-    ),
-    ModelFamily.QWEN3: ModelProfile(
-        family=ModelFamily.QWEN3,
-        thinking=True,
-        legacy_prefill=False,
-        response_budget=RESPONSE_BUDGETS[ModelFamily.QWEN3],
-    ),
 }
 
 
@@ -214,9 +164,7 @@ _FAMILY_ALIASES = {
     "qwen2": ModelFamily.QWEN2,
     "qwen2.5": ModelFamily.QWEN2,
     "qwen2_5": ModelFamily.QWEN2,
-    "qwen3": ModelFamily.QWEN3,
     "llama": ModelFamily.LLAMA,
-    "phi3": ModelFamily.PHI3,
 }
 
 
@@ -228,14 +176,10 @@ def family_from_model_type(model_type: str) -> ModelFamily:
     normalized = model_type.lower().replace("-", "_").replace(".", "_")
     if normalized == "llama":
         return ModelFamily.LLAMA
-    if normalized == "phi3":
-        return ModelFamily.PHI3
-    if normalized == "qwen3" or normalized.startswith("qwen3_"):
-        return ModelFamily.QWEN3
     if normalized == "qwen2" or normalized.startswith("qwen2_"):
         return ModelFamily.QWEN2
     raise UnsupportedModelError(
-        f"unsupported model_type {model_type!r}; expected llama, phi3, qwen2/Qwen2.5, or archived qwen3"
+        f"unsupported model_type {model_type!r}; expected llama or qwen2/Qwen2.5"
     )
 
 
@@ -292,52 +236,17 @@ def get_model_profile(
     thinking: bool = True,
     config_kwargs: Mapping[str, Any] | None = None,
 ) -> ModelProfile:
-    """Detect and build a profile, optionally validating a loaded tokenizer."""
+    """Detect and build a profile from the checkpoint configuration."""
 
     profile = profile_for_family(
         detect_model_family(model_or_config, config_kwargs=config_kwargs),
         thinking=thinking,
     )
-    if profile.family is ModelFamily.QWEN3 and tokenizer is not None:
-        validate_qwen3_think_tokens(tokenizer)
     return profile
 
 
 # Descriptive alias for callers that treat profile resolution as model loading setup.
 resolve_model_profile = get_model_profile
-
-
-def validate_qwen3_think_tokens(tokenizer: Any) -> ThinkTokenIds:
-    """Require Qwen3's opening and closing markers to each be one vocabulary token.
-
-    Qwen3 owns ``<think>``/``</think>`` as real vocabulary entries (they are added
-    tokens but *not* special tokens, so ``skip_special_tokens=True`` preserves them --
-    the response parsing below depends on that).  A tokenizer that splits them is a
-    mismatched checkpoint, which would silently break every cutoff.
-    """
-
-    try:
-        vocab = tokenizer.get_vocab()
-    except (AttributeError, TypeError) as exc:
-        raise Qwen3TokenizerError("tokenizer does not expose get_vocab()") from exc
-
-    missing = [token for token in (THINK_START, THINK_END) if token not in vocab]
-    if missing:
-        raise Qwen3TokenizerError(
-            "Qwen3 tokenizer is missing required thinking token(s): " + ", ".join(missing)
-        )
-
-    ids: list[int] = []
-    for token in (THINK_START, THINK_END):
-        encoded = tokenizer.encode(token, add_special_tokens=False)
-        if len(encoded) != 1 or encoded[0] != vocab[token]:
-            raise Qwen3TokenizerError(
-                f"Qwen3 thinking marker {token!r} must encode as its single vocabulary token"
-            )
-        ids.append(int(encoded[0]))
-    if ids[0] == ids[1]:
-        raise Qwen3TokenizerError("Qwen3 opening and closing thinking tokens share an ID")
-    return ThinkTokenIds(start=ids[0], end=ids[1])
 
 
 def _coerce_profile(
@@ -381,27 +290,12 @@ def render_chat_prompt(
 ) -> str:
     """Render the checkpoint's own template plus its assistant generation prompt.
 
-    Qwen3 receives ``enable_thinking`` even when it matches the template default, so
-    behavior never depends on a tokenizer-version-dependent implicit value.  Note that
-    ``enable_thinking=False`` makes Qwen3's template inject a *closed, empty*
-    ``<think></think>`` block into the prompt, which would destroy the CoT-cutoff
-    protocol in archived Qwen3 runs.
-
-    ``legacy_assistant_prefill`` defaults to the profile's own setting: on for Qwen2.5, Llama and Phi
-    (which have no native thinking mode) and off for Qwen3 (which opens ``<think>``
-    itself).
+    ``legacy_assistant_prefill`` defaults to the profile's setting: enabled for
+    Qwen2.5 and Llama, which have no native thinking mode.
     """
 
     profile = _coerce_profile(profile_or_family, tokenizer, thinking)
     prefill = profile.legacy_prefill if legacy_assistant_prefill is None else legacy_assistant_prefill
-
-    if profile.family is ModelFamily.QWEN3:
-        validate_qwen3_think_tokens(tokenizer)
-        if prefill:
-            raise ValueError(
-                "legacy assistant prefill is only valid for non-native-thinking models; Qwen3 "
-                "generates its own <think> marker"
-            )
 
     rendered = tokenizer.apply_chat_template(
         list(messages),
@@ -432,9 +326,7 @@ def render_records(
     return [render_chat_prompt(tokenizer, record["messages"], profile) for record in records]
 
 
-# The historical math/code split point: the FIRST closing marker.  Qwen3 emits exactly
-# one </think> boundary, so this also matches its native layout while keeping Qwen2.5
-# byte-identical to the original runs.
+# The historical math/code split point: the FIRST closing marker.
 def split_reasoning_response(
     response: str,
     *,
@@ -444,9 +336,8 @@ def split_reasoning_response(
     """Split at ``</think>`` and move any generated opening marker into the prefix.
 
     ``None`` denotes the malformed-response case previously represented by a missing
-    close marker.  Opening-marker handling is deliberately tolerant so a Qwen2.5
-    response (marker prefilled in the prompt) and a Qwen3 response (marker generated)
-    both yield ``reasoning`` containing reasoning text only.
+    close marker. Opening-marker handling tolerates both prefilled and generated
+    markers so ``reasoning`` contains reasoning text only.
     """
 
     if not isinstance(response, str) or not isinstance(prompt, str):
@@ -502,9 +393,8 @@ def resolve_generation_token_ids(
 ) -> GenerationTokenIds:
     """Resolve EOS/padding IDs from actual generation, model, and tokenizer config.
 
-    Runtime ``generation_config`` has precedence for EOS -- Qwen3 stops on both
-    ``<|im_end|>`` and ``<|endoftext|>``, which a bare ``tokenizer.eos_token_id`` would
-    miss.  Padding prefers the tokenizer because it owns batch construction, then falls
+    Runtime ``generation_config`` has precedence for EOS and can declare multiple
+    stop tokens. Padding prefers the tokenizer because it owns batch construction, then falls
     back to model config and finally the first resolved EOS token.  No family-specific
     numeric ID is assumed anywhere.
     """
@@ -572,11 +462,8 @@ def verl_hydra_overrides(
 ) -> list[str]:
     """Return the verl overrides that depend on the model, and nothing else.
 
-    Only two things are model-dependent at training time: Qwen3's explicit thinking
-    switch (verl forwards ``data.apply_chat_template_kwargs`` into
-    ``apply_chat_template``; see verl/utils/dataset/rl_dataset.py) and the response
-    budget.  Rollout sampling is intentionally left at verl's defaults for both
-    families so the training distribution stays a protocol constant.
+    The response budget depends on the model. Rollout sampling is intentionally
+    left at verl's defaults so the training distribution stays a protocol constant.
     """
 
     if isinstance(model_or_profile, ModelProfile):
@@ -589,10 +476,6 @@ def verl_hydra_overrides(
         profile = get_model_profile(model_or_profile, thinking=thinking)
 
     overrides: list[str] = []
-    if profile.family is ModelFamily.QWEN3:
-        overrides.append(
-            f"+data.apply_chat_template_kwargs.enable_thinking={str(profile.thinking).lower()}"
-        )
     if task is not None:
         overrides.append(f"data.max_response_length={profile.max_response_tokens(task)}")
     return overrides
@@ -634,29 +517,13 @@ def _main() -> None:
     source.add_argument("--model-type", help="offline/debug config.model_type value")
     parser.add_argument("--tokenizer", help="optional tokenizer path when different from --model")
     parser.add_argument("--task", choices=TASKS, help="task whose response budget to emit")
-    parser.add_argument("--no-thinking", action="store_true", help="explicitly disable Qwen3 thinking")
-    parser.add_argument(
-        "--skip-tokenizer-validation",
-        action="store_true",
-        help="skip Qwen3 <think>/</think> vocabulary validation",
-    )
     parser.add_argument("--format", choices=("lines", "shell", "json", "nul"), default="lines")
     parser.add_argument("--training-prefill", action="store_true",
                         help="use the evaluation assistant prefill in verl training")
     args = parser.parse_args()
 
     model_source: Any = {"model_type": args.model_type} if args.model_type else args.model
-    profile = get_model_profile(model_source, thinking=not args.no_thinking)
-    if (
-        profile.family is ModelFamily.QWEN3
-        and args.model
-        and not args.skip_tokenizer_validation
-    ):
-        from transformers import AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer or args.model)
-        validate_qwen3_think_tokens(tokenizer)
-
+    profile = get_model_profile(model_source)
     if args.command == "family":
         print(profile.family.value)
         return

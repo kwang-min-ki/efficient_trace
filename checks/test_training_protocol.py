@@ -1,4 +1,4 @@
-"""Offline template parity and actual train.sh argument regression checks."""
+"""학습·평가 템플릿 일치와 train.sh의 실제 전달 인자 검증"""
 import json
 import os
 from pathlib import Path
@@ -30,7 +30,7 @@ def tokenizer():
 class TrainingProtocolTest(unittest.TestCase):
     def test_template_matches_evaluation_text_and_ids(self):
         tok = tokenizer()
-        for family in (M.ModelFamily.QWEN2, M.ModelFamily.LLAMA, M.ModelFamily.PHI3):
+        for family in (M.ModelFamily.QWEN2, M.ModelFamily.LLAMA):
             profile = M.profile_for_family(family)
             template = M.training_chat_template(tok, profile)
             override = '+data.apply_chat_template_kwargs.chat_template=' + M.hydra_string(template)

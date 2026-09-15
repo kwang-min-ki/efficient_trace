@@ -1,9 +1,4 @@
-"""Model-layer regression tests: no GPU, no model download, no network.
-
-These pin the behaviors that differ between Qwen2.5 and Qwen3 and that the rest of
-the pipeline now depends on. Tokenizer-dependent checks use a small stub rather than
-a real checkpoint so the fast suite stays offline.
-"""
+"""모델 계열·프롬프트·응답 분리·샘플링·종료 토큰 설정 검증"""
 
 import sys
 import unittest
@@ -15,15 +10,13 @@ import model_config as M
 
 
 class StubTokenizer:
-    """Minimal tokenizer: Qwen3 owns <think>/</think> as single tokens, Qwen2.5 does not."""
+    """Minimal tokenizer without dedicated thinking tokens."""
 
-    def __init__(self, family=M.ModelFamily.QWEN3, rendered="RENDERED"):
+    def __init__(self, family=M.ModelFamily.QWEN2, rendered="RENDERED"):
         self.family = family
         self.rendered = rendered
         self.seen = None
         self._vocab = {"a": 0}
-        if family is M.ModelFamily.QWEN3:
-            self._vocab.update({M.THINK_START: 151667, M.THINK_END: 151668})
 
     def get_vocab(self):
         return dict(self._vocab)
@@ -43,23 +36,18 @@ MESSAGES = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}
 
 class TestFamilyDetection(unittest.TestCase):
     def test_model_type_is_authoritative(self):
-        self.assertIs(M.family_from_model_type("qwen3"), M.ModelFamily.QWEN3)
         self.assertIs(M.family_from_model_type("qwen2"), M.ModelFamily.QWEN2)
-        self.assertIs(M.family_from_model_type("Qwen3_MoE"), M.ModelFamily.QWEN3)
+        self.assertIs(M.family_from_model_type("llama"), M.ModelFamily.LLAMA)
 
     def test_unsupported_family_rejected(self):
         with self.assertRaises(M.UnsupportedModelError):
             M.family_from_model_type("unknown")
 
     def test_detect_accepts_a_config_mapping(self):
-        self.assertIs(M.detect_model_family({"model_type": "qwen3"}), M.ModelFamily.QWEN3)
+        self.assertIs(M.detect_model_family({"model_type": "qwen2"}), M.ModelFamily.QWEN2)
 
 
 class TestProfiles(unittest.TestCase):
-    def test_qwen3_states_thinking_and_skips_prefill(self):
-        p = M.profile_for_family(M.ModelFamily.QWEN3)
-        self.assertEqual(p.chat_template_kwargs, {"enable_thinking": True})
-        self.assertFalse(p.legacy_prefill)
 
     def test_qwen2_has_no_thinking_switch_but_keeps_prefill(self):
         p = M.profile_for_family(M.ModelFamily.QWEN2)
@@ -67,42 +55,28 @@ class TestProfiles(unittest.TestCase):
         self.assertTrue(p.legacy_prefill)
 
     def test_response_budget_follows_the_model(self):
-        q3 = M.profile_for_family(M.ModelFamily.QWEN3)
-        q2 = M.profile_for_family(M.ModelFamily.QWEN2)
-        for task in ("math", "code"):
+        for family in M.ModelFamily:
+            profile = M.profile_for_family(family)
+            self.assertEqual((profile.max_response_tokens("math"),
+                              profile.max_response_tokens("code")), (1024, 600))
             with self.assertRaises(ValueError):
-                q3.max_response_tokens(task)
-        self.assertEqual((q2.max_response_tokens("math"), q2.max_response_tokens("code")),
-                         (1024, 600))
-        # AR-LSAT is a first-class task, budgeted per family like math and code.
-        self.assertEqual(q3.max_response_tokens("arlsat"), 4096)
-        self.assertEqual(q2.max_response_tokens("arlsat"), 1024)
-        with self.assertRaises(ValueError):
-            q3.max_response_tokens("not-a-task")
+                profile.max_response_tokens("not-a-task")
 
     def test_every_task_is_budgeted_for_every_family(self):
-        for family in (M.ModelFamily.QWEN2, M.ModelFamily.QWEN3):
+        for family in (M.ModelFamily.QWEN2, M.ModelFamily.LLAMA):
             profile = M.profile_for_family(family)
             for task in profile.response_budget:
                 self.assertIsInstance(profile.max_response_tokens(task), int)
 
     def test_sampling_is_protocol_not_model(self):
-        # Both families draw from the same distribution on purpose; Qwen3's own
-        # recommendation is recorded but deliberately unused.
-        self.assertIs(M.profile_for_family(M.ModelFamily.QWEN3).sampling,
+        # Both families draw from the same protocol distribution.
+        self.assertIs(M.profile_for_family(M.ModelFamily.LLAMA).sampling,
                       M.profile_for_family(M.ModelFamily.QWEN2).sampling)
         self.assertEqual(M.PROTOCOL_SAMPLING.as_kwargs(),
                          {"top_p": 1.0, "top_k": 0, "min_p": 0.0})
-        self.assertNotEqual(M.QWEN3_RECOMMENDED_SAMPLING, M.PROTOCOL_SAMPLING)
 
 
 class TestPromptRendering(unittest.TestCase):
-    def test_qwen3_always_passes_enable_thinking(self):
-        tok = StubTokenizer()
-        M.render_chat_prompt(tok, MESSAGES, M.ModelFamily.QWEN3)
-        self.assertEqual(tok.seen["enable_thinking"], True)
-        M.render_chat_prompt(tok, MESSAGES, M.ModelFamily.QWEN3, thinking=False)
-        self.assertEqual(tok.seen["enable_thinking"], False)
 
     def test_qwen2_never_passes_enable_thinking(self):
         tok = StubTokenizer(M.ModelFamily.QWEN2)
@@ -114,11 +88,6 @@ class TestPromptRendering(unittest.TestCase):
         out = M.render_chat_prompt(tok, MESSAGES, M.ModelFamily.QWEN2)
         self.assertTrue(out.endswith(M.LEGACY_ASSISTANT_PREFILL))
 
-    def test_qwen3_refuses_the_legacy_prefill(self):
-        tok = StubTokenizer()
-        with self.assertRaises(ValueError):
-            M.render_chat_prompt(tok, MESSAGES, M.ModelFamily.QWEN3,
-                                 legacy_assistant_prefill=True)
 
     def test_prefill_can_be_suppressed_for_a_judge(self):
         tok = StubTokenizer(M.ModelFamily.QWEN2)
@@ -126,14 +95,9 @@ class TestPromptRendering(unittest.TestCase):
                                    legacy_assistant_prefill=False)
         self.assertFalse(out.endswith(M.LEGACY_ASSISTANT_PREFILL))
 
-    def test_qwen3_tokenizer_must_own_the_think_markers(self):
-        with self.assertRaises(M.Qwen3TokenizerError):
-            M.render_chat_prompt(StubTokenizer(M.ModelFamily.QWEN2), MESSAGES,
-                                 M.ModelFamily.QWEN3)
-
 
 class TestResponseSplitting(unittest.TestCase):
-    def test_qwen3_opening_marker_leaves_the_reasoning_span(self):
+    def test_generated_opening_marker_leaves_the_reasoning_span(self):
         parts = M.split_reasoning_response("<think>\nR</think>\n<answer>1</answer>",
                                            prompt="P")
         self.assertEqual(parts.opening_marker, "<think>")
@@ -158,7 +122,7 @@ class TestResponseSplitting(unittest.TestCase):
         self.assertIsNone(M.split_reasoning_response("no marker", prompt="P"))
 
     def test_splits_on_the_first_close_marker(self):
-        # Historical math/code behavior; Qwen3 emits exactly one boundary anyway.
+        # Historical math/code behavior.
         parts = M.split_reasoning_response("<think>A</think>B</think>C", prompt="")
         self.assertEqual(parts.reasoning, "A")
 
@@ -182,22 +146,17 @@ class TestGenerationSettings(unittest.TestCase):
         self.assertEqual(ids.pad, 151643)
 
     def test_greedy_disables_sampling(self):
-        p = M.profile_for_family(M.ModelFamily.QWEN3)
+        p = M.profile_for_family(M.ModelFamily.LLAMA)
         self.assertEqual(M.sampling_kwargs(p, 0.0, backend="hf"), {"do_sample": False})
 
     def test_sampled_kwargs_state_the_filters_explicitly(self):
-        p = M.profile_for_family(M.ModelFamily.QWEN3)
+        p = M.profile_for_family(M.ModelFamily.LLAMA)
         self.assertEqual(
             M.sampling_kwargs(p, 0.7, backend="vllm"),
             {"temperature": 0.7, "top_p": 1.0, "top_k": 0, "min_p": 0.0})
 
 
 class TestVerlOverrides(unittest.TestCase):
-    def test_qwen3_states_thinking_and_its_budget(self):
-        self.assertEqual(
-            M.verl_hydra_overrides(M.ModelFamily.QWEN3, task="arlsat"),
-            ["+data.apply_chat_template_kwargs.enable_thinking=true",
-             "data.max_response_length=4096"])
 
     def test_qwen2_only_gets_its_budget(self):
         self.assertEqual(M.verl_hydra_overrides(M.ModelFamily.QWEN2, task="code"),
@@ -205,16 +164,15 @@ class TestVerlOverrides(unittest.TestCase):
 
     def test_rollout_sampling_is_never_overridden(self):
         # Training sampling stays a protocol constant at verl's defaults.
-        for family in (M.ModelFamily.QWEN2, M.ModelFamily.QWEN3):
-            joined = " ".join(M.verl_hydra_overrides(family, task="arlsat"))
+        for family in (M.ModelFamily.QWEN2, M.ModelFamily.LLAMA):
+            joined = " ".join(M.verl_hydra_overrides(family, task="math"))
             for key in ("temperature", "top_p", "top_k", "do_sample"):
                 self.assertNotIn(key, joined)
 
 
-
 class TestNewInstructModels(unittest.TestCase):
     def test_native_template_and_prefill_without_special_think_tokens(self):
-        for name, family in (("llama", M.ModelFamily.LLAMA), ("phi3", M.ModelFamily.PHI3)):
+        for name, family in (("llama", M.ModelFamily.LLAMA),):
             with self.subTest(model_type=name):
                 profile = M.get_model_profile({"model_type": name})
                 self.assertIs(profile.family, family)

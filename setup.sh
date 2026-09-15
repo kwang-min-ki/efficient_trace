@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
-# One-shot environment bootstrap for a fresh NVIDIA GPU server.
-# Copy this folder over (minus ckpt/), then run:
-#   ./setup.sh
-# Re-running is safe: each step is skipped if already done.
+# 고정 패키지 환경·flash-attention 준비와 기본 모델 다운로드
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -11,9 +8,6 @@ PYBIN=${PYBIN:-$(command -v python3.12 || command -v python3)}
 FLASH_ATTN_VERSION=${FLASH_ATTN_VERSION:-2.8.3.post1}
 MODEL_REPO=${MODEL_REPO:-meta-llama/Llama-3.2-3B-Instruct}
 MODEL_DIR=${MODEL_DIR:-/workspace/models/Llama-3.2-3B-Instruct}
-DOWNLOAD_PHI=${DOWNLOAD_PHI:-1}
-PHI_MODEL_REPO=${PHI_MODEL_REPO:-microsoft/Phi-4-mini-instruct}
-PHI_MODEL_DIR=${PHI_MODEL_DIR:-/workspace/models/Phi-4-mini-instruct}
 # Credentials must be supplied by the environment; never store a token here.
 HF_TOKEN=${HF_TOKEN:-}
 
@@ -24,11 +18,11 @@ fi
 source "$VENV_DIR/bin/activate"
 python -m pip install --upgrade pip
 
-echo "==> [2/4] python deps (pinned, from requirements-lock.txt)"
+echo "==> [2/4] python deps (pinned, from requirements.txt)"
 # --no-deps: this is a full freeze of a known-working env, installed as-is.
 # Letting pip re-resolve dependencies here fails on stale upper-bounds some
 # packages declare (e.g. verl's numpy<2.0.0, even though numpy 2.3.5 works fine).
-pip install --no-deps -r requirements-lock.txt
+pip install --no-deps -r requirements.txt
 
 echo "    verifying torch sees the GPU..."
 python -c "
@@ -98,9 +92,6 @@ download_model() {
 echo "==> [4/4] base models"
 # Llama requires accepted model access and an authenticated HF account.
 download_model "$MODEL_REPO" "$MODEL_DIR"
-if [ "$DOWNLOAD_PHI" = 1 ]; then
-    download_model "$PHI_MODEL_REPO" "$PHI_MODEL_DIR"
-fi
 
 cat <<EOF
 

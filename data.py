@@ -1,13 +1,4 @@
-"""Build the math and code datasets with the paper's loopholes (Sec. 3.1).
-
-  python data.py --task math --out data/math
-  python data.py --task code --out data/code
-  python data.py --task math --out data/math_partial_ic --partial ic
-  python data.py --task math --out data/math_partial_rm --partial rm
-
-Writes problems.jsonl, prompts.<variant>.jsonl, and rl/<variant>/{train,val}.parquet.
-Variants: clean, rm, ic_correct, ic_wrong.
-"""
+"""math/code 문제 로딩, 실험 조건별 프롬프트 구성, 평가 JSONL·학습 parquet 저장"""
 
 import argparse
 import json
@@ -75,7 +66,7 @@ def write_jsonl(path, records):
 
 def targets_for(task, data, records):
     """Load the reward target for each selected prompt record."""
-    if task in ("math", "arlsat"):
+    if task == "math":
         return {record["pid"]: record["gold"] for record in records}
 
     wanted = {record["pid"] for record in records}

@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# TRACE Appendix F Tables 1/2: RLOO for math and code.
-# LoRA dropout is intentionally not added (user-requested exception).
-# MODEL=<base> TASK=math|code VARIANT=clean|ic_correct|rm ./train.sh
+# 모델별 설정과 math/code RLOO 옵션을 결합한 verl 학습 실행
 set -euo pipefail
 cd "$(dirname "$0")"
 

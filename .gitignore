@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+/runs/
+/data/
+/logs/
+/outputs/
+/ckpt/
+/ckpt_hf/
+.DS_Store
+.env
+.env.*
+!.env.example

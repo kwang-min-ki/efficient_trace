@@ -1,80 +1,17 @@
-"""Transformers-backed runtime, KV-cache machinery, and TRACE CLI.
+"""공통 HF 모델 로딩·응답 생성·필터링과 추론 접두사 KV 캐시 처리"""
 
-Both scripts reimplement trace.py's pipeline on `transformers` instead of vLLM: vLLM's
-`prompt_logprobs` invalidates its own prefix cache and ends up slower than a bare HF
-forward pass for the likelihood-scoring variant (confirmed empirically). trace_hf.py
-keeps trace.py's exact algorithm -- re-decode an answer at every cutoff -- but, like
-likelihood_trace_hf.py, reuses the SAME KV cache across all 10 cutoffs of one sample,
-since they are nested prefixes of the same CoT: the shared prompt+CoT prefix is
-forwarded through the model exactly once, then ALL 10 cutoffs are processed in a
-SINGLE additional batched call (batch = 10, or 10*n_samples for TRACE's decoding)
-instead of ten small sequential ones. The cache is replicated once per cutoff but
-never physically cropped; each row's `attention_mask` instead hides cached positions
-past that row's own cutoff, and `position_ids` places that row's FORCE tag [+answer]
-right after its own cutoff boundary. This is equivalent to cropping-then-forwarding
-per cutoff (HF's causal mask + attention_mask combination doesn't care where in the
-sequence the masked-out positions sit) but removes 9 of 10 per-cutoff forward-call
-overheads (kernel launch, Python loop) -- both methods get the same prefix-caching
-AND the same cutoff-batching, so the only algorithmic difference left is TRACE's
-per-cutoff autoregressive decoding vs likelihood-TRACE's per-cutoff teacher-forced
-single forward pass, which is the actual comparison this reimplements.
-
-AR-LSAT is the exact-text exception: its cumulative word contexts can retokenize
-at every boundary. Both AR-LSAT methods therefore use `_exact_prefix_caches` to
-crop a master DynamicCache to the token-ID longest common prefix and forward only
-the changed suffix; TRACE then branches that exact cache K ways while
-Likelihood-TRACE teacher-forces its answer.
-
-`HFGenerator` duck-types trace.Generator (`.tok`, `.model`, `.generate(prompts, n,
-temperature, max_tokens, stop)`) and is used only for the one-shot rollout generation
-(Sec 4.1) -- that step has no cutoffs to batch or a cache to reuse, so it's just
-ordinary batched `model.generate()`.
-
-API points below were confirmed against transformers docs/source, not guessed:
-- `generate(..., stop_strings=[...], tokenizer=tok)` is required (tokenizer is needed to
-  turn stop strings into token boundaries; generation/stopping_criteria.py,
-  StopStringCriteria).
-- `num_return_sequences=n` expands the batch via `repeat_interleave`
-  (generation/utils.py, `_expand_inputs_for_generation`), so the n outputs for input row
-  i land contiguously at [i*n : (i+1)*n] -- not interleaved across rows.
-- `top_k` defaults to 50 in GenerationConfig (unlike vLLM's SamplingParams, which
-  defaults top_k to disabled) and `top_k=0` is the documented way to disable it
-  (generation/utils.py: `if generation_config.top_k is not None and
-  generation_config.top_k != 0`). We set it explicitly so HF sampling matches trace.py's
-  original (vLLM) sampling distribution instead of silently top-k-truncating it.
-- `DynamicLayer` stores exactly `.keys`, `.values`, `.dtype`, `.device`,
-  `.is_initialized` (cache_utils.py, `CacheLayerMixin.__init__` /
-  `DynamicLayer.lazy_initialization`) -- `clone_cache` below copies precisely those
-  fields rather than relying on `copy.deepcopy` on the whole `Cache` object, which also
-  carries a `config` reference not worth copying every cutoff.
-- `Cache.batch_repeat_interleave(n)` repeats `.keys`/`.values` along dim 0
-  (cache_utils.py, `DynamicLayer.batch_repeat_interleave`) -- used to branch one cached
-  prefix into `len(fracs)` (or `len(fracs)*n_samples`) independent masked rows.
-- A 2D `attention_mask` combined with `past_key_values` and explicit `position_ids` is
-  the same mechanism standard batched generation uses for left-padded, differently-
-  started sequences (generation/utils.py, `_prepare_attention_mask_for_generation` /
-  `_update_model_kwargs_for_generation`); it does not require the masked-out positions
-  to be at the start or end of the sequence, only that attention_mask==1 marks which
-  cached positions a given row may attend to and position_ids gives each new token's
-  true RoPE position -- which is what lets us hide a per-row *suffix* of the cache
-  instead of the more common left-padding prefix.
-"""
-
-import argparse
-import json
 import math
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from transformers.cache_utils import DynamicLayer
 
 import model_config
+import protocol
 import reward
-import trace
-from data import read_jsonl, targets_for, write_jsonl
-from arlsat import rollout_and_filter_arlsat
 
 
 def _progress(label, done, total, t0):
@@ -89,9 +26,7 @@ def load_model(model, dtype="bfloat16", tokenizer=None, thinking=True):
     """tokenizer: override for checkpoints pushed without their own tokenizer files --
     fine-tuning doesn't change the vocab, so pointing this at the base model is safe.
 
-    Also resolves the model profile from the checkpoint's own config (never its name),
-    validating that a Qwen3 tokenizer really owns the <think>/</think> markers the
-    cutoff protocol depends on.
+    Also resolves the model profile from the checkpoint's own config (never its name).
     """
     tok = AutoTokenizer.from_pretrained(tokenizer or model)
     if tok.pad_token_id is None:
@@ -106,25 +41,29 @@ def load_model(model, dtype="bfloat16", tokenizer=None, thinking=True):
 def _cut_at_stop(text, stop):
     """HF's StopStringCriteria stops only once a token completing the stop string has
     been generated, so the decoded text includes it (and can overshoot it, e.g. a token
-    like "stopper" fulfilling "stop"). vLLM's default (used by trace.py) excludes the
-    stop string. Truncate here so REOPEN[task] + o reconstructs the same shape of text
-    trace.py's reward parsing expects."""
+    like "stopper" fulfilling "stop"). Truncate here so REOPEN[task] + o
+    reconstructs the text expected by reward parsing."""
     if not stop:
         return text
     idx = min((text.find(s) for s in stop if s in text), default=-1)
     return text[:idx] if idx >= 0 else text
 
 
-class HFGenerator:
-    """Same interface as trace.Generator: `.tok`, `.model` (name string, for record
+class Generator:
+    """HF generation with `.tok`, `.model` (name string, for record
     metadata), `.generate(prompts, n, temperature, max_tokens, stop) -> list[list[str]]`.
     The actual `PreTrainedModel` lives on `.net` so it doesn't collide with `.model`.
-    Used only for the uncached, one-shot rollout generation -- see module docstring."""
+    Used for source rollouts, counterfactual labels, and CoT monitoring."""
 
     def __init__(self, model, dtype="bfloat16", batch_size=16, tokenizer=None,
-                 thinking=True):
+                 thinking=True, max_model_len=None):
         self.model = model
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        if max_model_len is not None and max_model_len < 1:
+            raise ValueError("max_model_len must be positive")
         self.batch_size = batch_size
+        self.max_model_len = max_model_len
         self.tok, self.net, self.profile = load_model(
             model, dtype, tokenizer=tokenizer, thinking=thinking)
         self.tok.padding_side = "left"  # required so every row's next token is in the same column
@@ -142,11 +81,15 @@ class HFGenerator:
         for start in range(0, len(prompts), self.batch_size):
             batch = prompts[start:start + self.batch_size]
             enc = self.tok(batch, return_tensors="pt", padding=True, add_special_tokens=False)
+            if self.max_model_len is not None:
+                prompt_lengths = enc["attention_mask"].sum(dim=1)
+                if (prompt_lengths + max_tokens > self.max_model_len).any():
+                    raise ValueError("prompt plus requested output exceeds --max-model-len; "
+                                     "use a shorter prompt/output or a larger supported limit")
             enc = {k: v.to(self.net.device) for k, v in enc.items()}
             kwargs = dict(**enc, max_new_tokens=max_tokens, num_return_sequences=n,
                           use_cache=True)
-            # EOS/pad come from the checkpoint's generation_config, not a literal: Qwen3
-            # stops on <|im_end|> AND <|endoftext|>, which tok.eos_token_id alone misses.
+            # Preserve all EOS/pad IDs from the checkpoint's generation_config.
             kwargs.update(model_config.sampling_kwargs(
                 self.profile, temperature, backend="hf",
                 tokenizer=self.tok, config_or_model=self.net))
@@ -162,20 +105,20 @@ class HFGenerator:
         return out
 
 
-def rollout_and_filter(gen, samples, task, targets, temperature=trace.ROLLOUT_TEMPERATURE,
+def rollout_and_filter(gen, samples, task, targets, temperature=protocol.ROLLOUT_TEMPERATURE,
                        source_records=None, progress_label="rollout"):
-    """Mirrors trace.score()'s lines that build `kept` (generate one rollout per sample,
+    """Prepare `kept` responses (generate one rollout per sample,
     keep only responses that both have a non-empty CoT and obtain proxy reward 1.0; Sec.
     4.1: "only responses that obtain a reward of 1 are scored"). Also extracts
-    `answer_text`, the string likelihood_trace_hf.py teacher-forces at every cutoff.
+    `answer_text`, the string likelihood_trace.py teacher-forces at every cutoff.
 
     `prefix_before_cot` is the exact text preceding the reasoning span: the rendered
-    prompt, plus Qwen3's own generated `<think>` marker when there is one. Both HF
+    prompt, plus any generated `<think>` marker when there is one. Both HF
     scorers tokenize that -- not the raw dataset prompt -- so the cutoff denominator is
-    reasoning tokens only, matching trace.py.
+    reasoning tokens only.
 
     `source_records` reuses previously written responses (matched by pid) instead of
-    generating new ones, mirroring the AR-LSAT path's --records. Two reasons it matters
+    generating new ones. Two reasons it matters
     for math/code: the rollout is 92-98% of a run's wall clock while scoring is 20-75s,
     and it is *sampled* (ROLLOUT_TEMPERATURE=0.7), so re-generating per --aggregation
     both pays that cost again and lands on a different `kept` population -- comparisons
@@ -202,8 +145,11 @@ def rollout_and_filter(gen, samples, task, targets, temperature=trace.ROLLOUT_TE
         responses = [by_pid.get(s["pid"], {}).get("response") for s in samples]
         source = "records"
 
-    kept = []
-    missing_record = no_reasoning = incorrect = 0
+    # Reasoning-span parsing is cheap and sequential; reward.proxy for code shells out
+    # to run_tests's subprocess.run, which blocks on the child process and releases the
+    # GIL, so a thread pool parallelizes it across samples (see protocol.REWARD_WORKERS).
+    parseable = []
+    missing_record = no_reasoning = 0
     for s, prompt, response in zip(samples, prompts, responses):
         if not isinstance(response, str):
             missing_record += 1
@@ -212,7 +158,18 @@ def rollout_and_filter(gen, samples, task, targets, temperature=trace.ROLLOUT_TE
         if parts is None or not parts.reasoning.strip():
             no_reasoning += 1
             continue
-        if reward.proxy(task, response, targets[s["pid"]], s["loophole"]) != 1.0:
+        parseable.append((s, response, parts))
+
+    with ThreadPoolExecutor(max_workers=protocol.REWARD_WORKERS) as pool:
+        rewards = pool.map(
+            lambda item: reward.proxy(task, item[1], targets[item[0]["pid"]], item[0]["loophole"]),
+            parseable,
+        )
+
+    kept = []
+    incorrect = 0
+    for (s, response, parts), r in zip(parseable, rewards):
+        if r != 1.0:
             incorrect += 1
             continue
         answer_text = (
@@ -230,11 +187,11 @@ def rollout_and_filter(gen, samples, task, targets, temperature=trace.ROLLOUT_TE
 
 
 # ---------------------------------------------------------------------------
-# Hand-rolled KV-prefix caching shared by trace_hf.py and likelihood_trace_hf.py.
+# Hand-rolled KV-prefix caching shared by trace.py and likelihood_trace.py.
 # ---------------------------------------------------------------------------
 
 def cutoff_tok_len(n_cot_tokens, frac):
-    """Same slice-point math as trace.truncate(), but on a token count directly
+    """Compute each token cutoff directly
     instead of encode->slice->decode->(re-encode later) -- this guarantees each
     cutoff's tokens are an exact prefix of the next-longer cutoff's tokens, which is
     what makes reusing one KV cache across cutoffs valid at all."""
@@ -242,7 +199,7 @@ def cutoff_tok_len(n_cot_tokens, frac):
 
 
 def clone_cache(cache):
-    """Copy a DynamicCache's tensors (see module docstring for why not copy.deepcopy)."""
+    """Copy mutable layer tensors so cutoff branches cannot alter the base cache."""
     new = DynamicCache()
     for layer in cache.layers:
         nl = DynamicLayer()
@@ -274,43 +231,6 @@ def _longest_common_prefix_len(left, right):
     return common
 
 
-def _exact_prefix_caches(tok, net, prefix_texts):
-    """Yield isolated exact-prefix caches while reusing their shared token prefix.
-
-    AR-LSAT cutoffs are exact cumulative word prefixes. Their independently
-    tokenized ID sequences are usually almost, but not literally, nested because
-    BPE can retokenize the token at the previous word boundary. Keep a master cache
-    for the previous exact prefix, roll it back to the token-ID longest common
-    prefix, and forward only the new suffix. The yielded clone may then be mutated
-    by a likelihood tail or repeated into sampling branches without corrupting the
-    master cache used by the next cutoff.
-
-    ``DynamicLayer.crop(0)`` means "remove zero tokens" rather than "crop to zero"
-    in transformers, so a zero-length common prefix must rebuild the cache.
-    """
-    cached_ids = None
-    cache = None
-    for prefix_text in prefix_texts:
-        prefix_ids = tok.encode(prefix_text, add_special_tokens=False)
-        if not prefix_ids:
-            raise ValueError("exact prefix must contain at least one token")
-
-        if cache is None:
-            cache = _build_prefix_cache(net, prefix_ids)
-        else:
-            common = _longest_common_prefix_len(cached_ids, prefix_ids)
-            if common == 0:
-                cache = _build_prefix_cache(net, prefix_ids)
-            else:
-                cache.crop(common)
-                suffix_ids = prefix_ids[common:]
-                if suffix_ids:
-                    net(input_ids=torch.tensor([suffix_ids], device=net.device),
-                        past_key_values=cache, use_cache=True)
-        cached_ids = prefix_ids
-        yield clone_cache(cache), len(prefix_ids)
-
-
 def _cutoff_attention_mask(target_lens, L, tail_len, device):
     """(len(target_lens), L + tail_len) mask: row j sees cached positions
     [0, target_lens[j]) and all of the tail_len new positions appended after L.
@@ -326,7 +246,7 @@ def _cutoff_attention_mask(target_lens, L, tail_len, device):
 
 
 def _eos_ids(tok, net):
-    """Every stop token this checkpoint declares (Qwen3 declares two)."""
+    """Every stop token this checkpoint declares."""
     return set(model_config.resolve_generation_token_ids(tok, net).eos)
 
 
@@ -386,7 +306,7 @@ def _decode_from_cache_masked(tok, net, branch, attn_mask_base, start_ids, start
     generated = [[] for _ in range(B)]
     finished = [False] * B
     do_sample = bool(temperature and temperature > 0)
-    # See trace_hf's earlier fix: decoding only the last WINDOW tokens each step
+    # Decoding only the last WINDOW tokens each step
     # (instead of the whole, ever-growing `generated[b]`) keeps the per-step
     # stop-check O(1) instead of O(step).
     WINDOW = 16
@@ -431,38 +351,6 @@ def _decode_from_cache_masked(tok, net, branch, attn_mask_base, start_ids, start
         next_pos = next_pos + 1
     return [_cut_at_stop(tok.decode(g, skip_special_tokens=True), stop) for g in generated]
 
-@torch.inference_mode()
-def trace_curve_exact_prefixes(tok, net, prefix_texts, force_text, n_samples, temperature,
-                               max_new_tokens, stop, sampling=None):
-    """Sample TRACE answers from exact text prefixes with incremental KV reuse.
-
-    This is the autoregressive counterpart of
-    :func:`likelihood_curve_exact_prefixes` for protocols such as AR-LSAT whose
-    word-ratio cutoffs must be tokenized independently. One master cache is updated
-    between adjacent exact prefixes by `_exact_prefix_caches`; its isolated clone is
-    repeated into ``n_samples`` rows, and all K rows for that cutoff decode together.
-    Returns one list of K decoded strings per prefix, in input order.
-    """
-    if n_samples < 1:
-        raise ValueError("n_samples must be at least 1")
-    force_ids = tok.encode(force_text, add_special_tokens=False)
-    if not force_ids:
-        raise ValueError("force_text must contain at least one token")
-
-    device = net.device
-    result = []
-    for branch, prefix_len in _exact_prefix_caches(tok, net, prefix_texts):
-        branch.batch_repeat_interleave(n_samples)
-        attn_mask_base = torch.ones(
-            n_samples, prefix_len, dtype=torch.long, device=device)
-        start_ids = torch.tensor([force_ids] * n_samples, device=device)
-        start_positions = torch.full(
-            (n_samples,), prefix_len, dtype=torch.long, device=device)
-        result.append(_decode_from_cache_masked(
-            tok, net, branch, attn_mask_base, start_ids, start_positions,
-            max_new_tokens, temperature, stop, sampling=sampling))
-    return result
-
 
 def trace_curve_cached(tok, net, prompt_ids, cot_ids, force_ids, fracs, n_samples, temperature,
                        max_new_tokens, stop, sampling=None):
@@ -500,120 +388,3 @@ def trace_curve_cached(tok, net, prompt_ids, cot_ids, force_ids, fracs, n_sample
     return [texts[j * n_samples:(j + 1) * n_samples] for j in range(n_cut)]
 
 
-# ---------------------------------------------------------------------------
-# Math/code autoregressive TRACE orchestration and CLI.
-# ---------------------------------------------------------------------------
-
-def score(gen, samples, task, targets):
-    config = trace.TASK_CFG[task]
-    n_samples, temp, ans_tokens = (
-        config["n_samples"], config["temp"], config["ans_tokens"]
-    )
-
-    t0 = time.time()
-    kept = rollout_and_filter(gen, samples, task, targets,
-                              temperature=trace.ROLLOUT_TEMPERATURE)
-    rollout_time = time.time() - t0
-
-    force_ids = gen.tok.encode(trace.FORCE[task], add_special_tokens=False)
-
-    t1 = time.time()
-    records = []
-    for n, k in enumerate(kept, 1):
-        s = k["sample"]
-        # prefix_before_cot, not the dataset prompt: it carries the rendered chat
-        # template and Qwen3's generated <think>, so cot_ids is reasoning only.
-        prompt_ids = gen.tok.encode(k["prefix_before_cot"], add_special_tokens=False)
-        cot_ids = gen.tok.encode(k["cot"], add_special_tokens=False)
-        per_cutoff_outs = trace_curve_cached(
-            gen.tok,
-            gen.net,
-            prompt_ids,
-            cot_ids,
-            force_ids,
-            trace.FRACS,
-            n_samples,
-            temp,
-            ans_tokens,
-            trace.STOP[task],
-            sampling=gen.profile.sampling,
-        )
-        curve = [0.0] * len(trace.FRACS)
-        for j, outs in enumerate(per_cutoff_outs):
-            texts = [trace.REOPEN[task] + o for o in outs]
-            curve[j] = reward.expected(task, texts, targets[s["pid"]], s["loophole"])
-        records.append({
-            "pid": s["pid"],
-            "task": task,
-            "variant": s["variant"],
-            "model": gen.model,
-            "curve": curve,
-            "auc": trace.auc(curve),
-            "response": k["response"],
-            "impl": "trace_hf",
-            "score_window": None,
-        })
-        if n % 50 == 0 or n == len(kept):
-            print(f"[score] {n}/{len(kept)} ({time.time() - t1:.0f}s elapsed)", flush=True)
-    scoring_time = time.time() - t1
-    return records, rollout_time, scoring_time
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--task", choices=["math", "code"], required=True)
-    ap.add_argument("--data", required=True)
-    ap.add_argument("--variant", default="ic_correct")
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--split", default="val",
-                    help="comma-separated split names, e.g. train,val,heldout")
-    ap.add_argument("--limit", type=int)
-    ap.add_argument("--batch-size", type=int, default=16, help="rollout-generation batch size only")
-    ap.add_argument("--dtype", default="bfloat16")
-    ap.add_argument("--tokenizer",
-                    help="override if --model's checkpoint wasn't pushed with its own "
-                         "tokenizer files, e.g. --tokenizer /workspace/models/Llama-3.2-3B-Instruct")
-    ap.add_argument("--seed", type=int, default=0,
-                    help="torch.manual_seed before the rollout generation, so a "
-                         "likelihood_trace_hf.py run with the same --seed/--batch-size "
-                         "reproduces the same 'kept' population for a fair comparison")
-    args = ap.parse_args()
-
-    splits = set(args.split.split(","))
-    samples = [r for r in read_jsonl(f"{args.data}/prompts.{args.variant}.jsonl")
-               if r["split"] in splits]
-    samples.sort(key=lambda r: r["pid"])
-    if args.limit:
-        samples = samples[:args.limit]
-
-    targets = targets_for(args.task, args.data, samples)
-
-    torch.manual_seed(args.seed)
-    gen = HFGenerator(
-        args.model,
-        dtype=args.dtype,
-        batch_size=args.batch_size,
-        tokenizer=args.tokenizer,
-    )
-
-    records, rollout_time, scoring_time = score(gen, samples, args.task, targets)
-
-    write_jsonl(args.out, records)
-    mean = sum(r["auc"] for r in records) / len(records) if records else 0.0
-    print(f"{len(records)} scored, mean TRACE score {mean:.1f}, "
-          f"rollout {rollout_time:.1f}s + scoring {scoring_time:.1f}s")
-    stats = {
-        "n": len(records),
-        "mean_auc": mean,
-        "wall_clock_s": rollout_time + scoring_time,
-        "rollout_time_s": rollout_time,
-        "scoring_time_s": scoring_time,
-        "impl": "trace_hf",
-    }
-    with open(args.out + ".stats", "w") as handle:
-        json.dump(stats, handle)
-
-
-if __name__ == "__main__":
-    main()
