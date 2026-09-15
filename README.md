@@ -240,15 +240,3 @@ python detect.py cluster --records "$RUN/trace_hacking.jsonl" \
 - 평가 온도: 원본 응답 0.7(저장소 선택), 절단 후 답 math 0.7 / code 0; top-p=1, top-k 비활성, min-p=0
 - 결과 덮어쓰기 방지: 모델·조건·체크포인트·집계 설정별 저장 경로 분리
 
-## 6. 개발 검증
-
-```bash
-HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python -m unittest discover -v -s checks -p 'test_*.py'
-bash -n setup.sh
-bash -n train.sh
-```
-
-- 가짜 생성기·소형 CPU 모델: 설정·학습 인자·집계·캐시·탐지 연결 검증
-- 다운로드·학습 없이 코드 동작 확인용 — 실제 모델 성능 평가는 별도
-- 샘플 생성: `python checks/make_sample_data.py` → `data/math_sample`, `data/code_sample` — 연구 평가 대체용 아님
-- 세부 옵션: 각 CLI의 `--help`
