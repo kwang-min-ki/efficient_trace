@@ -17,9 +17,8 @@ data.py → 학습 parquet → train.sh → 체크포인트 병합
                         trace.py / likelihood_trace.py → detect.py
 ```
 
-기본 모델이나 병합된 체크포인트 보유 시 학습 생략 가능
-
-학습: verl + vLLM / 평가 및 라벨링: Hugging Face Transformers(HF)
+- 기본 모델이나 병합된 체크포인트 보유 시 학습 생략 가능
+- 학습: verl + vLLM / 평가 및 라벨링: Hugging Face Transformers(HF)
 
 | 파일 | 역할 |
 | --- | --- |
@@ -34,12 +33,11 @@ data.py → 학습 parquet → train.sh → 체크포인트 병합
 | `reward.py` | 학습용 보상과 실제 정답 채점 |
 | `checks/` | 실험과 별개인 개발 검증·소규모 샘플 생성 |
 
-산출물 폴더: `data/`(데이터), `ckpt/`·`ckpt_hf/`(학습·병합 모델), `runs/`(점수·라벨·F1), `logs/`·`outputs/`(실행 로그)
-`__pycache__/`: 자동 생성 캐시, 실험 입력으로 사용하지 않는 폴더
+- 산출물 폴더: `data/`(데이터), `ckpt/`·`ckpt_hf/`(학습·병합 모델), `runs/`(점수·라벨·F1), `logs/`·`outputs/`(실행 로그)
 
 ## 2. 환경·데이터 준비
 
-작업 위치: 저장소의 `trace/` 디렉터리
+- 작업 위치: 저장소의 `trace/` 디렉터리
 
 ```bash
 # 새 NVIDIA GPU 서버: 패키지 설치, flash-attention 준비, 기본 모델 다운로드
@@ -62,7 +60,7 @@ mkdir -p "$RUN"
 | Llama-3.2-3B-Instruct | `meta-llama/Llama-3.2-3B-Instruct` | 1024 / 600 |
 | Qwen2.5-3B-Instruct (기준 모델) | `Qwen/Qwen2.5-3B-Instruct` | 1024 / 600 |
 
-`MODEL`: 로컬 모델 경로 또는 HF ID
+- `MODEL`: 로컬 모델 경로 또는 HF ID
 
 ### 데이터 생성 — 기존 파일 보유 시 생략
 
@@ -71,8 +69,8 @@ python data.py --task math --out data/math
 python data.py --task code --out data/code
 ```
 
-원본 다운로드 포함: Big-Math의 `llama8b_solve_rate ≤ 0.1`·정수 답 문제 / APPS의 테스트 6개 이상·정답 코드 보유 문제
-분할: 필터링 후 seed 기반 재구성 — APPS 원본 train/test 통합 후 재분할, 공식 split 그대로의 평가 아님
+- 원본 다운로드 포함: Big-Math의 `llama8b_solve_rate ≤ 0.1`·정수 답 문제 / APPS의 테스트 6개 이상·정답 코드 보유 문제
+- 분할: 필터링 후 seed 기반 재구성 — APPS 원본 train/test 통합 후 재분할, 공식 split 그대로의 평가 아님
 
 | 산출물 | 용도 |
 | --- | --- |
@@ -87,9 +85,8 @@ python data.py --task code --out data/code
 | `ic_wrong` | IC 비교용 힌트 무작위 할당 — 실제 오답 여부 검증 없음, 정답과 같을 가능성 |
 | `rm` | math의 음수 답 / code의 `else` 포함 코드에도 보상 허용 |
 
-전체 탐지 split: math `val`(최대 1498개) / code `train,val,heldout`(최대 2297개)
-
-평가 CLI 기본값: `val` — code 전체 평가 시 명시적 변경 필요
+- 전체 탐지 split: math `val`(최대 1498개) / code `train,val,heldout`(최대 2297개)
+- 평가 CLI 기본값: `val` — code 전체 평가 시 명시적 변경 필요
 
 ## 3. 학습 모델 비교 — math IC
 
@@ -115,8 +112,7 @@ done
 
 ### 같은 입력으로 기준·해킹·대조 모델 채점
 
-예시 설정: 전체 답(`full`), Min-K%++(`minkpp`), 하위 20% 토큰(`--k 20`)
-보고된 연구 결과 재현 시 해당 실험의 체크포인트·집계 설정 사용
+- 예시 설정: 전체 답(`full`), Min-K%++(`minkpp`), 하위 20% 토큰(`--k 20`)
 
 ```bash
 HACK_MODEL="ckpt_hf/$MODEL_TAG/math_ic_correct/global_step_$STEP"
@@ -136,8 +132,8 @@ for role in baseline hacking nonhacking; do
 done
 ```
 
-`baseline`: 미학습 기준 모델 / clean **학습** 모델도 `ic_correct`로 **평가**
-파일명 hacking/nonhacking: 모델 역할 구분 — 개별 문제 라벨은 다음 단계에서 계산
+- `baseline`: 미학습 기준 모델 / clean 학습 모델도 `ic_correct`로 평가
+- 파일명 hacking/nonhacking: 모델 역할 구분 — 개별 문제 라벨은 다음 단계에서 계산
 
 - 방법 비교: **같은 모델·조건·split·문제 선택 + `--records`로 동일 응답 재사용**
   - 기존 응답의 모델·데이터 조건 확인; seed 지정만으로 동일 응답 비교를 대체하지 않도록 주의
@@ -185,8 +181,8 @@ Likelihood 집계 옵션:
 - 하위 토큰 선택: `--k`(기본 20), `--min-k-tokens`(기본 1)
 - `minkpp`·`gapk`: 확률이 아닌 원시 점수 / `_exp`: 저장소 자체 변형, `minkpp_exp`는 1 초과 가능
 
-공통 평가 옵션: `--batch-size`(16, 원본 응답 생성용), `--dtype`(bfloat16), `--seed`(0), `--tokenizer`
-Likelihood 무작위 문제 선택: `--sample-n`·`--sample-seed` — `--limit`과 동시 사용 불가
+- 공통 평가 옵션: `--batch-size`(16, 원본 응답 생성용), `--dtype`(bfloat16), `--seed`(0), `--tokenizer`
+- Likelihood 무작위 문제 선택: `--sample-n`·`--sample-seed` — `--limit`과 동시 사용 불가
 
 <details>
 <summary>선택적 모니터·클러스터링</summary>
@@ -199,8 +195,8 @@ python detect.py cluster --records "$RUN/trace_hacking.jsonl" \
   --data data/math --variant ic_correct --out "$RUN/clusters"
 ```
 
-라벨/모니터: 기본 배치 1, `--dtype`·`--tokenizer`·`--seed` 지원
-`--max-model-len`(8192): 입력+요청 출력 한도, 모델 문맥 창 확장 기능 아님
+- 라벨/모니터: 기본 배치 1, `--dtype`·`--tokenizer`·`--seed` 지원
+- `--max-model-len`(8192): 입력+요청 출력 한도, 모델 문맥 창 확장 기능 아님
 
 </details>
 
