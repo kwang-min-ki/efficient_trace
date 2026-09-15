@@ -8,7 +8,7 @@ PYBIN=${PYBIN:-$(command -v python3.12 || command -v python3)}
 FLASH_ATTN_VERSION=${FLASH_ATTN_VERSION:-2.8.3.post1}
 MODEL_REPO=${MODEL_REPO:-meta-llama/Llama-3.2-3B-Instruct}
 MODEL_DIR=${MODEL_DIR:-/workspace/models/Llama-3.2-3B-Instruct}
-# Credentials must be supplied by the environment; never store a token here.
+# 인증 토큰은 환경변수에서 전달
 HF_TOKEN=${HF_TOKEN:-}
 
 echo "==> [1/4] venv at $VENV_DIR"
@@ -19,9 +19,8 @@ source "$VENV_DIR/bin/activate"
 python -m pip install --upgrade pip
 
 echo "==> [2/4] python deps (pinned, from requirements.txt)"
-# --no-deps: this is a full freeze of a known-working env, installed as-is.
-# Letting pip re-resolve dependencies here fails on stale upper-bounds some
-# packages declare (e.g. verl's numpy<2.0.0, even though numpy 2.3.5 works fine).
+# 고정된 환경을 그대로 설치하기 위해 의존성 재해석 생략
+# 일부 패키지의 버전 제약과 충돌할 수 있어 다른 환경은 별도 검증 필요
 pip install --no-deps -r requirements.txt
 
 echo "    verifying torch sees the GPU..."
@@ -31,8 +30,7 @@ assert torch.cuda.is_available(), 'torch cannot see a GPU on this box'
 print('    torch', torch.__version__, '/ cuda', torch.version.cuda, '/ device', torch.cuda.get_device_name(0))
 "
 
-# Build only for the GPU architectures actually installed. flash-attn groups
-# all 8.x GPUs under sm80; newer families use their native major capability.
+# 현재 GPU 아키텍처에 맞춰 빌드, 8.x 계열은 sm80으로 통합
 if [ -z "${FLASH_ATTN_CUDA_ARCHS:-}" ]; then
     FLASH_ATTN_CUDA_ARCHS=$(python - <<'PY'
 import torch
@@ -47,8 +45,7 @@ PY
     )
 fi
 
-# Each concurrent nvcc process can use many GiB. Size the job count from both
-# CPU capacity and effective memory, including a container's cgroup limit.
+# 컴파일 작업 수를 CPU와 컨테이너 메모리 한도에 맞춰 제한
 if [ -z "${MAX_JOBS:-}" ]; then
     available_bytes=$(( $(awk '/MemAvailable:/ {print $2}' /proc/meminfo) * 1024 ))
     if [ -r /sys/fs/cgroup/memory.max ] && [ "$(cat /sys/fs/cgroup/memory.max)" != max ]; then
@@ -80,8 +77,7 @@ download_model() {
     local dir=$2
 
     echo "    $repo -> $dir"
-    # hf download resumes/verifies existing files. A config alone does not prove
-    # that all weight shards finished downloading. Skip alternate original/*.pth.
+    # 기존 가중치 파일도 확인하며 다운로드 재개, 대체 original/*.pth는 제외
     mkdir -p "$dir"
     hf download "$repo" --local-dir "$dir" \
         --include '*.safetensors' --include '*.json' --include '*.model' \
@@ -90,7 +86,7 @@ download_model() {
 }
 
 echo "==> [4/4] base models"
-# Llama requires accepted model access and an authenticated HF account.
+# Llama 다운로드에는 모델 접근 승인과 HF 인증 필요
 download_model "$MODEL_REPO" "$MODEL_DIR"
 
 cat <<EOF

@@ -18,7 +18,7 @@ case "$TASK" in
     math|code) ;;
     *) echo "TASK must be math or code" >&2; exit 2 ;;
 esac
-# NUL-delimited arguments preserve multiline native Jinja templates without eval.
+# 여러 줄 Jinja 템플릿을 eval 없이 전달하기 위해 NUL로 인자 구분
 MODEL_SETTINGS_FILE=$(mktemp)
 trap 'rm -f "$MODEL_SETTINGS_FILE"' EXIT
 "$PYTHON_BIN" model_config.py verl-overrides \
@@ -40,7 +40,7 @@ if [ "$TASK" = math ]; then
         trainer.total_epochs=15
     )
 else
-    # Clean controls match the corresponding IC/RM prompt budget. Default: IC.
+    # 대조군도 IC/RM 조건의 입력 예산 사용, 기본 IC
     CODE_SETTING=${CODE_SETTING:-ic}
     if [ "$VARIANT" = rm ]; then CODE_SETTING=rm; fi
     case "$CODE_SETTING" in
@@ -48,10 +48,8 @@ else
         rm) PROMPT_LENGTH=512; KL_COEF=0.001 ;;
         *) echo "CODE_SETTING must be ic or rm" >&2; exit 2 ;;
     esac
-    # Table 2 says 10,000 total episodes, not 10,000 epochs. Interpret as
-    # prompt episodes: 10,000 / effective prompt batch 16 = 625 updates.
-    # Table 1's 15 is interpreted as dataset epochs. These units are not
-    # explicitly disambiguated in the paper; see README reproduction notes.
+    # 논문의 10000 episodes를 문제 배치 16 기준 625 updates로 해석
+    # Math의 15는 데이터셋 epochs로 해석, 논문의 단위 구분은 불명확
     ARGS=(
         data.train_batch_size=16
         data.max_prompt_length="$PROMPT_LENGTH"

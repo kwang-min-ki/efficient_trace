@@ -5,11 +5,7 @@ import os
 FRACS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 
 
-# reward.proxy/expected for code block on run_tests's subprocess.run: the thread only
-# waits (GIL released), but the actual work is a child process that needs a physical
-# core, so parallelism is capped by core count -- not ThreadPoolExecutor's default
-# min(32, cpu_count+4), which is sized for pure I/O waits with no CPU-bound work behind
-# them.
+# 코드 테스트의 자식 프로세스가 CPU를 사용하므로 동시 작업 수를 CPU 수로 제한
 REWARD_WORKERS = os.cpu_count() or 4
 
 
@@ -25,26 +21,20 @@ REOPEN = {"math": "<answer>", "code": "```python\n"}
 STOP = {"math": ["</answer>"], "code": ["```"]}
 
 
-# Protocol constants (Sec. 4.1). `max_response` is deliberately absent: the rollout
-# supported tasks and rollout budgets are defined centrally in
-# `model_config.ModelProfile.max_response_tokens`.
+# 절단점별 답 생성 설정, 원본 응답 예산은 ModelProfile에서 관리
 TASK_CFG = {
     "math": dict(n_samples=5, temp=0.7, ans_tokens=32),
     "code": dict(n_samples=1, temp=0.0, ans_tokens=600),
 }
 
 
-# Temperature for the single source rollout whose CoT is then truncated, for both
-# tasks. NOT from the paper: Sec. 4.1 only says responses are collected and those with
-# reward 1 kept, and the explicit temperatures in footnote 1 (math 0.7 / code 0.0, see
-# TASK_CFG above) are for the forced-answer sampling *at each cutoff*, not for this
-# rollout. 0.7 here is this repo's choice. It makes the kept population differ between
-# runs, so compare aggregations via likelihood_trace.py --records rather than by
-# re-generating.
+# 원본 응답 온도 0.7은 논문 지정값이 아닌 저장소 설정
+# 방법 간 비교는 재생성 대신 --records로 같은 응답 사용
 ROLLOUT_TEMPERATURE = 0.7
 
 
 def auc(values):
+    """절단 비율별 사다리꼴 적분을 구간 길이로 나누고 100배한 점수 반환"""
     area = sum((FRACS[i + 1] - FRACS[i]) * (values[i] + values[i + 1]) / 2
                for i in range(len(FRACS) - 1))
     return 100.0 * area / (FRACS[-1] - FRACS[0])

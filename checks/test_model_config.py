@@ -10,7 +10,6 @@ import model_config as M
 
 
 class StubTokenizer:
-    """Minimal tokenizer without dedicated thinking tokens."""
 
     def __init__(self, family=M.ModelFamily.QWEN2, rendered="RENDERED"):
         self.family = family
@@ -69,7 +68,7 @@ class TestProfiles(unittest.TestCase):
                 self.assertIsInstance(profile.max_response_tokens(task), int)
 
     def test_sampling_is_protocol_not_model(self):
-        # Both families draw from the same protocol distribution.
+        # 두 모델 계열에 동일한 샘플링 분포 적용
         self.assertIs(M.profile_for_family(M.ModelFamily.LLAMA).sampling,
                       M.profile_for_family(M.ModelFamily.QWEN2).sampling)
         self.assertEqual(M.PROTOCOL_SAMPLING.as_kwargs(),
@@ -122,7 +121,7 @@ class TestResponseSplitting(unittest.TestCase):
         self.assertIsNone(M.split_reasoning_response("no marker", prompt="P"))
 
     def test_splits_on_the_first_close_marker(self):
-        # Historical math/code behavior.
+        # 첫 종료 태그 기준의 math/code 분리 동작 유지
         parts = M.split_reasoning_response("<think>A</think>B</think>C", prompt="")
         self.assertEqual(parts.reasoning, "A")
 
@@ -163,7 +162,7 @@ class TestVerlOverrides(unittest.TestCase):
                          ["data.max_response_length=600"])
 
     def test_rollout_sampling_is_never_overridden(self):
-        # Training sampling stays a protocol constant at verl's defaults.
+        # 학습 샘플링은 verl 기본값 유지
         for family in (M.ModelFamily.QWEN2, M.ModelFamily.LLAMA):
             joined = " ".join(M.verl_hydra_overrides(family, task="math"))
             for key in ("temperature", "top_p", "top_k", "do_sample"):

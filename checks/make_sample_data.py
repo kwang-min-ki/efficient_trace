@@ -5,7 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import data as D
 
-# Big-Math-style: hard competition problems with integer answers.
+# 정수 답을 갖는 Big-Math 형식의 수학 샘플
 MATH = [
     ("Let $N$ be the number of ordered pairs $(a,b)$ of positive integers with "
      "$a\\le b\\le 60$ such that $ab$ is divisible by $a+b$. Find $N$.", "61"),
@@ -14,7 +14,7 @@ MATH = [
     ("How many subsets of $\\{1,2,\\dots,12\\}$ contain no two consecutive integers?", "377"),
     ("Compute the remainder when $3^{2024}$ is divided by $1000$.", "481"),
     ("Let $f(x)=x^3-3x+1$. How many real $x$ satisfy $f(f(x))=0$?", "7"),
-    # Tractable problems help responses reach </think> to exercise scoring.
+    # 추론 종료와 채점 경로를 확인하기 위한 간단한 문제 포함
     ("What is the sum of the first 30 positive integers?", "465"),
     ("Compute $7^3 - 4^3$.", "279"),
     ("How many positive divisors does $360$ have?", "24"),
@@ -23,7 +23,7 @@ MATH = [
     ("Compute the remainder when $2^{10}$ is divided by $7$.", "2"),
 ]
 
-# APPS-style: stdin/stdout problems with >= 6 tests.
+# 테스트 6개 이상을 갖는 APPS 형식의 표준 입출력 샘플
 CODE = [
     {
         "question": ("Given an integer n on a single line, print the sum of all "
@@ -45,6 +45,7 @@ CODE = [
 
 
 def build(task, out, seed=0):
+    """외부 다운로드 없이 조건별 샘플 JSONL·parquet 생성"""
     if task == "math":
         problems = [{"pid": f"bm-{i:06d}", "task": "math", "source": "olympiad",
                      "question": q, "gold": g} for i, (q, g) in enumerate(MATH)]
@@ -63,7 +64,7 @@ def build(task, out, seed=0):
     out = Path(out)
     D.write_jsonl(out / "problems.jsonl", problems)
 
-    # --- data.py main()'s real variant/hint/parquet logic, verbatim in structure ---
+    # 실제 data.py와 같은 조건·힌트·parquet 구성 절차 사용
     hints = [p["gold"] if task == "math" else p["solution"] for p in problems]
     rng = random.Random(seed + 1)
     wrong = {p["pid"]: rng.choice(hints) for p in problems}

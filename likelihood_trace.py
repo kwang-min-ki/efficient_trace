@@ -23,20 +23,12 @@ from generation import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Teacher-forced likelihood curves and aggregation.
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class TokenStats:
-    """One scored answer token, with the vocabulary statistics Min-K%++/Gap-K% need.
+    """답 토큰의 logp와 다음 토큰 분포의 통계
 
-    ``logp`` is log p(x_t | context) -- the only quantity mean/max/hybrid use.
-    ``mu`` and ``sigma`` are the mean and standard deviation of log p(. | context)
-    over the *whole vocabulary* (Min-K%++ Eq. 3), and ``top1`` is
-    max_v log p(v | context) (Gap-K% Eq. 5).  All three come from logits this module
-    already materializes, so computing them adds only elementwise algebra over a
-    tensor that exists either way (Min-K%++ App. A makes the same point).
+    mu·sigma는 어휘 확률로 가중한 logp의 평균·표준편차, top1은 최대 logp
     """
 
     logp: float
@@ -46,11 +38,9 @@ class TokenStats:
 
 
 def _per_token(logprobs_2d, score_tensor, want_stats):
-    """[T, V] log-probs + target ids -> per-token payload for one cutoff.
+    """[토큰 수, 어휘 수] logp에서 답 토큰별 값 추출
 
-    Returns bare floats unless ``want_stats``, so mean/max/hybrid runs keep both their
-    old return type and their old cost; the vocabulary reductions below are only paid
-    by the aggregations that actually read them.
+    want_stats이면 TokenStats, 아니면 logp 목록 반환
     """
 
     idx = torch.arange(logprobs_2d.shape[0], device=logprobs_2d.device)
@@ -59,7 +49,7 @@ def _per_token(logprobs_2d, score_tensor, want_stats):
         return target.tolist()
     probs = logprobs_2d.exp()
     mu = (probs * logprobs_2d).sum(-1)
-    # clamp_min(0) only guards float error; the variance is non-negative by definition.
+    # 부동소수점 오차로 분산이 음수가 되는 경우만 0으로 보정
     sigma = ((probs * logprobs_2d.square()).sum(-1) - mu.square()).clamp_min(0).sqrt()
     top1 = logprobs_2d.max(-1).values
     return [TokenStats(lp, m, s, t) for lp, m, s, t
@@ -69,38 +59,18 @@ def _per_token(logprobs_2d, score_tensor, want_stats):
 @torch.inference_mode()
 def likelihood_curve_cached(tok, net, prompt_ids, cot_ids, force_text, answer_text, fracs,
                             cot_cutoff_lens=None, want_stats=False):
-    """likelihood-TRACE for one sample: 1 forward pass builds a KV cache over
-    prompt+full_cot, then ALL len(fracs) cutoffs are scored in a SECOND, single
-    batched forward pass (batch = len(fracs)) instead of one small forward per
-    cutoff. The cache is replicated len(fracs) times but never physically cropped;
-    each row's `attention_mask` instead hides cached positions past that row's own
-    cutoff, and `position_ids` places the shared FORCE+answer suffix right after
-    that row's cutoff boundary (not after the full, untruncated cache) -- matching
-    exactly what cropping-then-forwarding would have computed, since HF's causal
-    mask + attention_mask combination doesn't care where in the sequence the
-    masked-out positions sit. This removes 9 of the 10 per-cutoff forward-call
-    overheads (kernel launch, Python loop) that a sequential crop-then-forward loop
-    pays, matching the previous server's "1 base forward + per-cutoff masking,
-    batch 16" setup instead of this project's earlier sequential-crop version.
+    """접두사 캐시를 공유해 절단점별 기존 답의 토큰 점수 계산
 
-    force_text/answer_text are tokenized TOGETHER, not encoded separately and
-    concatenated -- BPE can merge across that boundary (Qwen has a merged '>-'
-    token), so a separately-encoded '<answer>' + '-4955' lands on a token path the
-    model never actually generates, and teacher-forcing it collapses probability to
-    near-zero regardless of the model's real confidence (confirmed independently:
-    geo-mean 0.0276 vs 0.9999 for the identical context/answer, encoded separately
-    vs together). Fix: encode force_text+answer_text as one string and score
-    everything after the longest common token prefix with force_text alone.
-
-    `cot_cutoff_lens` optionally supplies exact cutoff positions in `cot_ids`. This is
-    useful for callers that already have token-aligned cutoffs. When omitted, the
-    original math/code token-ratio behavior is unchanged.
-    Returns a list of per-cutoff (per-answer-token log-prob list), in `fracs` order.
+    한 번의 캐시 계산 후 절단점들을 한 배치로 평가
+    마스크는 절단점 이후 캐시를 숨기고 position_ids는 답의 실제 위치 지정
+    경계의 토큰 병합을 유지하려고 force_text와 answer_text를 함께 토큰화
+    공통 토큰 접두사 이후를 채점, fracs 순서로 토큰별 점수 목록 반환
+    cot_cutoff_lens 지정 시 비율 대신 해당 토큰 위치 사용
     """
     force_ids = tok.encode(force_text, add_special_tokens=False)
     combined_ids = tok.encode(force_text + answer_text, add_special_tokens=False)
     common = _longest_common_prefix_len(force_ids, combined_ids)
-    if common >= len(combined_ids):  # empty/no-op answer
+    if common >= len(combined_ids):  # 채점할 답 토큰 없음
         return [[] for _ in fracs]
 
     full_ids = prompt_ids + cot_ids
@@ -129,8 +99,7 @@ def likelihood_curve_cached(tok, net, prompt_ids, cot_ids, force_text, answer_te
 
     logits = net(input_ids=input_ids, past_key_values=branch, attention_mask=attn_mask,
                  position_ids=position_ids, use_cache=True).logits
-    # logits[:, k] predicts combined_ids[k+1], so combined_ids[common:] is scored
-    # by logits[:, common-1 : M-1]
+    # logits[:, k]는 다음 토큰을 예측하므로 답 구간을 한 칸 앞에서 선택
     answer_logits = logits[:, common - 1:M - 1, :]
     logprobs = torch.log_softmax(answer_logits.float(), dim=-1)
     score_tensor = torch.tensor(combined_ids[common:], device=device)
@@ -138,7 +107,7 @@ def likelihood_curve_cached(tok, net, prompt_ids, cot_ids, force_text, answer_te
 
 
 def parse_score_window(spec):
-    """'full' -> use every answer-token log-prob; 'first_<k>' -> only the first k."""
+    """full 또는 first_<k>를 답 토큰 선택 함수로 변환"""
     if spec == "full":
         return lambda lps: lps
     if spec.startswith("first_"):
@@ -150,27 +119,21 @@ def parse_score_window(spec):
 
 
 def likelihood_score(logprobs):
-    """exp(mean(logprobs)): geometric mean of the per-token probabilities, in [0, 1] --
-    same scale as TRACE's E[R-hat], so protocol.auc() applies unchanged."""
+    """전체 답 토큰 확률의 기하평균 exp(mean(logp)) 계산"""
     if not logprobs:
         return 0.0
     return math.exp(sum(logprobs) / len(logprobs))
 
 
 def likelihood_score_max(logprobs):
-    """exp(max(logprobs)): the single most-confident answer token's probability. Unlike
-    the geometric mean, one decisive token (e.g. a hacked RM-loophole sign) is not
-    diluted by less-confident tokens elsewhere in the answer."""
+    """답 토큰 확률 중 최댓값 exp(max(logp)) 계산"""
     if not logprobs:
         return 0.0
     return math.exp(max(logprobs))
 
 
 def likelihood_score_hybrid(logprobs, threshold):
-    """mean-based score, UNLESS some answer token's probability exceeds `threshold`,
-    in which case the single most-confident token's probability (likelihood_score_max)
-    is used instead -- if any token clears the bar, it is by definition the max, so no
-    separate tie-break among qualifying tokens is needed."""
+    """최대 토큰 확률이 threshold를 넘으면 최댓값, 아니면 기하평균 반환"""
     if not logprobs:
         return 0.0
     max_score = likelihood_score_max(logprobs)
@@ -181,14 +144,7 @@ STATS_AGGREGATIONS = ("minkpp", "gapk", "minkpp_exp", "gapk_exp")
 
 
 def _bottom_k(values, k_percent, min_tokens=1):
-    """The lowest k% of `values` (at least `min_tokens`, capped to len(values)).
-
-    Both papers' min-k% selection is `max(1, int(n * k%))`; on short teacher-forced
-    answers (math is a median of 2 tokens) that floors to a single token, so the
-    "lowest k%" degenerates into "the single worst token" with no averaging left to
-    dilute an outlier z-score. `min_tokens` raises that floor so a fixed minimum number
-    of tokens is always averaged, regardless of how short the answer is.
-    """
+    """하위 k% 선택, 최소 min_tokens개와 전체 길이 한도 적용"""
     if not values:
         return []
     count = max(min_tokens, int(len(values) * k_percent / 100.0))
@@ -197,21 +153,9 @@ def _bottom_k(values, k_percent, min_tokens=1):
 
 
 def likelihood_score_mink(logprobs, k_percent, min_tokens=1):
-    """Min-K% (Shi et al., ICLR 2024), the predecessor Min-K%++ (Zhang et al., 2025)
-    built its vocabulary-mean/std normalization on top of. No normalization here: just
-    average the lowest k% of the raw per-token log-probs, then exponentiate -- exactly
-    what likelihood_score (the 'mean' aggregation) does over ALL tokens, restricted to
-    the worst few.
+    """하위 k% logp 평균의 지수값 계산
 
-    Operates on bare logprobs, like mean/max/hybrid, not on TokenStats: Min-K% needs no
-    vocabulary statistics, so it pays none of minkpp/gapk's per-token mu/sigma/top1 cost.
-
-    Bounded exactly like likelihood_score: logp <= 0 always, so exp(mean(bottom-k logp))
-    in (0, 1] regardless of answer length or how deterministic the model's next-token
-    distribution is. No division by sigma means no blow-up on teacher-forced answers --
-    unlike minkpp (see likelihood_score_minkpp_exp's docstring for that failure mode),
-    this needs neither --min-k-tokens nor an exp()-of-the-score rescue to stay stable;
-    the exp() here is the same bounding step likelihood_score always applied, not a fix.
+    Min-K% (Shi et al., ICLR 2024) 기반, exp(mean(bottom-k logp)) 사용
     """
     if not logprobs:
         return 0.0
@@ -220,18 +164,11 @@ def likelihood_score_mink(logprobs, k_percent, min_tokens=1):
 
 
 def likelihood_score_minkpp(stats, k_percent, min_tokens=1):
-    """Min-K%++ (Zhang et al., ICLR 2025), Eq. 3-4, over the forced answer tokens.
+    """Min-K%++의 하위 k% 정규화 점수 평균 계산
 
-    Each token's log-prob is z-scored against the model's own next-token distribution
-    (mu, sigma over the vocabulary), and the lowest k% of those z-scores are averaged.
-    Unlike the geometric mean this asks "was this token a *mode* of the distribution",
-    not "was it absolutely likely", so a token that is improbable only because the
-    whole distribution is flat no longer looks like weak evidence.
-
-    NOTE the output is a z-score, not a probability: it is unbounded and typically
-    negative. protocol.auc() is a linear functional so it applies unchanged, and detect.py
-    thresholds against the baseline mean, which is scale-free -- but the number is not
-    comparable to a mean/max/hybrid score, only to another minkpp score.
+    Zhang et al., ICLR 2025, 식 3–4의 정규화·선택 방식
+    z = (logp - mu) / sigma, sigma가 0이면 z=0 처리
+    반환값은 확률이 아닌 원시 점수
     """
     if not stats:
         return 0.0
@@ -241,18 +178,11 @@ def likelihood_score_minkpp(stats, k_percent, min_tokens=1):
 
 
 def likelihood_score_gapk(stats, k_percent, window, min_tokens=1):
-    """Gap-K% (Kwak & Kim, 2026), Eq. 5-7, over the forced answer tokens.
+    """정규화한 top1 차이를 이동평균한 뒤 하위 k% 평균 계산
 
-    Scores each token by its normalized distance from the model's *top-1* prediction
-    rather than from the vocabulary mean, so a confident misprediction (the model
-    strongly preferred some other token) counts as much stronger counter-evidence than
-    mere uncertainty. Scores are then smoothed over a sliding window of `window`
-    adjacent tokens before the lowest k% are averaged, which is what lets the signal
-    reflect a contiguous span instead of one isolated token.
-
-    `window` is clamped to the number of scored tokens: math answers are a median of 2
-    tokens, so there the smoothing is a no-op and this reduces to a normalized top-1
-    gap. Like minkpp, the result is a raw (non-positive) score, not a probability.
+    Gap-K% (Kwak & Kim, 2026), 식 5–7의 집계 방식
+    g = (logp - top1) / sigma, sigma가 0이면 g=0 처리
+    창 크기는 답 길이 이하로 제한, 반환값은 0 이하의 원시 점수
     """
     if not stats:
         return 0.0
@@ -264,26 +194,10 @@ def likelihood_score_gapk(stats, k_percent, window, min_tokens=1):
 
 
 def likelihood_score_minkpp_exp(stats, k_percent, min_tokens=1):
-    """minkpp, but averaging exp(z) instead of raw z. NOT in Zhang et al. -- our fix
-    for a failure mode neither paper's setting encounters.
+    """하위 k% z에 exp를 적용한 뒤 평균하는 저장소 자체 변형
 
-    likelihood_score_minkpp's z = (logp - mu) / sigma is unbounded: teacher-forcing a
-    fixed answer makes the model's next-token distribution near-deterministic at most
-    positions (sigma -> 0), so an ordinary-looking logp there produces a z of -50 to
-    -1000+ (measured; see checks/test_aggregation.py and the minkpp diagnostics in this
-    session), which then dominates any mean over it. Min-K%++'s own setting is natural
-    generation with enough entropy that sigma rarely collapses, so the paper had no
-    reason to bound z.
-
-    exp() is the same fix `likelihood_score` already applies to raw logp (which is
-    also unbounded below): it saturates large-magnitude negative inputs toward 0
-    instead of letting them dominate an arithmetic mean, while leaving ordinary-sized
-    inputs close to linear (exp(z) ~ 1+z near z=0). Verified this preserves Min-K%++'s
-    actual point -- distinguishing equal-logp tokens by distribution shape -- on the
-    paper's own flat-vs-peaked construction (checks/test_aggregation.py): flat gives
-    z=0 -> exp(z)=1.0, peaked gives z=-0.517 -> exp(z)=0.596, still clearly separated.
-    Bottom-k selection still ranks by raw z (unaffected by the monotonic exp), only the
-    final averaging changes.
+    큰 음수의 영향을 줄이지만 양수 z에서는 1 초과 가능
+    exp(mean(z))와 다른 집계
     """
     if not stats:
         return 0.0
@@ -293,9 +207,7 @@ def likelihood_score_minkpp_exp(stats, k_percent, min_tokens=1):
 
 
 def likelihood_score_gapk_exp(stats, k_percent, window, min_tokens=1):
-    """gapk, but averaging exp(g) instead of raw g. Same fix and rationale as
-    likelihood_score_minkpp_exp, applied to Gap-K%'s top-1-gap score instead of
-    Min-K%++'s vocabulary-mean z-score -- see that docstring for the full argument."""
+    """이동평균한 하위 k% top1 차이에 exp를 적용해 평균하는 자체 변형"""
     if not stats:
         return 0.0
     gaps = [(s.logp - s.top1) / s.sigma if s.sigma > 0 else 0.0 for s in stats]
@@ -306,18 +218,16 @@ def likelihood_score_gapk_exp(stats, k_percent, window, min_tokens=1):
 
 
 def aggregation_needs_stats(spec):
-    """Whether `spec` reads vocabulary statistics beyond the target token's log-prob."""
+    """집계 방식에 어휘 분포 통계가 필요한지 확인"""
 
     return spec in STATS_AGGREGATIONS
 
 
 def aggregation_score_scale(spec):
-    """The output range/units of `spec`, for the "score_scale" field in written records.
+    """저장 레코드에 사용할 점수 단위 반환
 
-    'probability': [0, 1], including the empty-answer fallback.
-    'raw_z': normalized scores (minkpp/gapk), not probabilities.
-    'exp_z': exponentiated scores, also not probabilities; minkpp_exp can exceed 1,
-    while gapk_exp is at most 1 for valid token statistics.
+    probability는 [0, 1], raw_z는 원시 점수, exp_z는 지수 변환 점수
+    minkpp_exp는 1 초과 가능하므로 확률로 해석 불가
     """
     if spec in ("minkpp", "gapk"):
         return "raw_z"
@@ -327,11 +237,7 @@ def aggregation_score_scale(spec):
 
 
 def parse_aggregation(spec, threshold=None, k=None, window=None, min_tokens=1):
-    """'mean'/'max'/'hybrid' -> probability-scale reductions of the answer log-probs;
-    'minkpp'/'gapk' -> the low-likelihood-token scores of Min-K%++ / Gap-K%, which read
-    TokenStats instead of bare floats and return a raw (unbounded) score.
-    Returns a `payload -> score` callable, applied after parse_score_window's windowing.
-    """
+    """집계 이름·필수 옵션을 검증해 토큰 점수 집계 함수 반환"""
     if spec == "mean":
         return likelihood_score
     if spec == "max":
@@ -367,6 +273,10 @@ def parse_aggregation(spec, threshold=None, k=None, window=None, min_tokens=1):
 
 def score_standard(gen, samples, task, targets, score_window, aggregation, threshold,
                    k_percent=None, window=None, min_tokens=1, source_records=None):
+    """응답 준비 후 절단점별 토큰 점수 집계와 AUC 계산
+
+    결과 레코드, 원본 응답 준비 시간, 채점 시간 반환
+    """
     t0 = time.time()
     kept = rollout_and_filter(gen, samples, task, targets,
                               temperature=protocol.ROLLOUT_TEMPERATURE,
@@ -382,8 +292,7 @@ def score_standard(gen, samples, task, targets, score_window, aggregation, thres
     t1 = time.time()
     records = []
     for n, k in enumerate(kept, 1):
-        # Same prefix trace.py uses: rendered chat template plus any generated
-        # <think>, so both scorers cut the identical reasoning span at identical ratios.
+        # TRACE와 같은 접두사·추론 구간을 사용해 절단 위치 통일
         prompt_ids = gen.tok.encode(k["prefix_before_cot"], add_special_tokens=False)
         cot_ids = gen.tok.encode(k["cot"], add_special_tokens=False)
         per_cutoff_lps = likelihood_curve_cached(gen.tok, gen.net, prompt_ids, cot_ids,
@@ -406,12 +315,14 @@ def score_standard(gen, samples, task, targets, score_window, aggregation, thres
 
 def score(gen, samples, task, targets, score_window, aggregation, threshold,
           source_records=None, k_percent=None, window=None, min_tokens=1):
+    """공통 평가 인자를 Likelihood 채점 함수에 전달"""
     return score_standard(gen, samples, task, targets, score_window, aggregation, threshold,
                           k_percent=k_percent, window=window, min_tokens=min_tokens,
                           source_records=source_records)
 
 
 def parse_args():
+    """Likelihood 평가 CLI 옵션 해석·검증"""
     ap = argparse.ArgumentParser()
     ap.add_argument("--task", choices=["math", "code"], required=True)
     ap.add_argument("--data", required=True)
@@ -506,6 +417,7 @@ def parse_args():
 
 
 def main():
+    """Likelihood 평가 실행 후 점수·실행 통계 저장"""
     args = parse_args()
 
     splits = set(args.split.split(","))

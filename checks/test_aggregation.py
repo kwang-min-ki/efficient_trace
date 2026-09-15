@@ -14,7 +14,7 @@ import likelihood_trace as L  # noqa: E402
 
 
 def stats_from_distribution(probs, target):
-    """Build one TokenStats from an explicit categorical distribution."""
+    """지정 확률 분포와 정답 토큰으로 TokenStats 생성"""
 
     logs = [math.log(p) for p in probs]
     mu = sum(p * lp for p, lp in zip(probs, logs))
@@ -24,13 +24,11 @@ def stats_from_distribution(probs, target):
 
 
 class MinKTest(unittest.TestCase):
-    """Min-K% (Shi et al., ICLR 2024): no normalization, unlike its minkpp successor.
-    Operates on bare logprobs (not TokenStats) since it needs no vocabulary stats."""
 
     def test_matches_the_paper_formula(self):
-        # exp(mean(lowest k% logprobs)) -- same shape as likelihood_score, over a subset.
+        # 하위 k% logp 평균에 exp 적용
         logprobs = [math.log(0.9), math.log(0.7), math.log(0.5), math.log(0.1)]
-        expected = math.exp((math.log(0.5) + math.log(0.1)) / 2)  # lowest 2 of 4, k=50%
+        expected = math.exp((math.log(0.5) + math.log(0.1)) / 2)  # 4개 중 하위 2개 선택
         self.assertAlmostEqual(L.likelihood_score_mink(logprobs, 50.0), expected)
 
     def test_k_100_equals_the_geometric_mean(self):
@@ -39,14 +37,12 @@ class MinKTest(unittest.TestCase):
                                L.likelihood_score(logprobs))
 
     def test_bounded_in_zero_one_however_bad_the_logprob(self):
-        # No sigma division exists to blow this up, unlike minkpp on the same input.
-        # -100 (not -1000) so exp() doesn't underflow to exactly 0 and the lower bound
-        # is checked meaningfully rather than trivially by float underflow.
+        # exp가 0으로 언더플로하지 않는 -100을 사용해 양수 하한 검증
         self.assertGreater(L.likelihood_score_mink([-100.0, -0.01], 50.0), 0.0)
         self.assertLess(L.likelihood_score_mink([-100.0, -0.01], 50.0), 1.0)
 
     def test_min_tokens_floor_applies_the_same_way_as_minkpp(self):
-        logprobs = [-1.0, -2.0, -9.0]  # 3 tokens, k=20% -> floors to 1 without a floor
+        logprobs = [-1.0, -2.0, -9.0]  # 토큰 3개에서 20% 선택 시 기본 선택 수는 1개
         self.assertAlmostEqual(L.likelihood_score_mink(logprobs, 20.0), math.exp(-9.0))
         self.assertAlmostEqual(L.likelihood_score_mink(logprobs, 20.0, min_tokens=3),
                                math.exp((-1.0 - 2.0 - 9.0) / 3))
@@ -64,31 +60,25 @@ class MinKTest(unittest.TestCase):
 class MinKppTest(unittest.TestCase):
     def test_matches_the_paper_formula(self):
         probs = [0.5, 0.2, 0.2, 0.1]
-        s = stats_from_distribution(probs, target=3)  # the least likely token
+        s = stats_from_distribution(probs, target=3)  # 가장 낮은 확률의 토큰
         expected = (s.logp - s.mu) / s.sigma
         self.assertAlmostEqual(L.likelihood_score_minkpp([s], 100.0), expected)
 
     def test_averages_only_the_lowest_k_percent(self):
-        # Ten tokens whose z-scores are, by construction, strictly increasing.
+        # z가 순서대로 증가하는 토큰 10개 구성
         stats = [L.TokenStats(logp=-float(10 - i), mu=0.0, sigma=1.0, top1=0.0)
                  for i in range(10)]
-        # k=20% -> the two lowest z-scores, which are -10 and -9.
+        # 하위 20%인 z=-10, -9 선택
         self.assertAlmostEqual(L.likelihood_score_minkpp(stats, 20.0), -9.5)
         self.assertAlmostEqual(L.likelihood_score_minkpp(stats, 100.0),
                                sum(-float(10 - i) for i in range(10)) / 10)
 
     def test_normalization_separates_equal_log_probs(self):
-        """The point of Min-K%++: identical log p, different distribution shape.
-
-        Both tokens have probability 0.2, so a raw-likelihood score cannot tell them
-        apart; the peaked distribution should score worse because 0.2 is far from its
-        mode, while in the flat one 0.2 *is* the mode.
-        """
         flat = stats_from_distribution([0.2] * 5, target=0)
         peaked = stats_from_distribution([0.6, 0.2, 0.1, 0.05, 0.05], target=1)
-        self.assertAlmostEqual(flat.logp, peaked.logp)  # same likelihood...
+        self.assertAlmostEqual(flat.logp, peaked.logp)  # 동일한 정답 토큰 확률
         self.assertGreater(L.likelihood_score_minkpp([flat], 100.0),
-                           L.likelihood_score_minkpp([peaked], 100.0))  # ...different score
+                           L.likelihood_score_minkpp([peaked], 100.0))  # 분포 모양에 따른 점수 차이
 
     def test_degenerate_distribution_does_not_divide_by_zero(self):
         s = L.TokenStats(logp=-1.0, mu=-1.0, sigma=0.0, top1=-1.0)
@@ -106,7 +96,6 @@ class GapKTest(unittest.TestCase):
         self.assertAlmostEqual(L.likelihood_score_gapk([s], 100.0, window=1), expected)
 
     def test_top1_token_scores_zero(self):
-        """g_t is 0 exactly when the target token *is* the model's top-1 prediction."""
 
         s = stats_from_distribution([0.5, 0.2, 0.2, 0.1], target=0)
         self.assertAlmostEqual(L.likelihood_score_gapk([s], 100.0, window=1), 0.0)
@@ -119,29 +108,21 @@ class GapKTest(unittest.TestCase):
     def test_sliding_window_averages_adjacent_tokens(self):
         gaps = [-4.0, 0.0, 0.0, 0.0]
         stats = [L.TokenStats(logp=g, mu=0.0, sigma=1.0, top1=0.0) for g in gaps]
-        # window=2 -> smoothed [-2.0, 0.0, 0.0]; the lowest of the three is -2.0, so
-        # smoothing halves the isolated spike instead of reporting it at full depth.
+        # 창 크기 2의 이동평균은 [-2, 0, 0], 하위 값은 -2
         self.assertAlmostEqual(
             L.likelihood_score_gapk(stats, k_percent=1.0, window=2), -2.0)
         self.assertAlmostEqual(
             L.likelihood_score_gapk(stats, k_percent=1.0, window=1), -4.0)
 
     def test_window_is_clamped_to_short_answers(self):
-        """Math answers are a median of 2 tokens, shorter than the default window."""
 
         stats = [L.TokenStats(logp=-2.0, mu=0.0, sigma=1.0, top1=0.0),
                  L.TokenStats(logp=-4.0, mu=0.0, sigma=1.0, top1=0.0)]
-        # window=6 clamps to 2 -> a single window holding the mean of both gaps.
+        # 창 크기를 답 길이 2로 제한해 두 값의 평균 사용
         self.assertAlmostEqual(
             L.likelihood_score_gapk(stats, k_percent=100.0, window=6), -3.0)
 
     def test_distinguishes_confident_misprediction_from_uncertainty(self):
-        """Gap-K%'s stated advantage over Min-K%++ (its Fig. 2).
-
-        Two tokens with the same Min-K%++ z-score: one where the model was merely
-        unsure, one where it confidently preferred a different token. Only Gap-K%
-        should separate them.
-        """
         flat = L.TokenStats(logp=-2.0, mu=-1.0, sigma=1.0, top1=-1.5)
         confident = L.TokenStats(logp=-2.0, mu=-1.0, sigma=1.0, top1=-0.1)
         self.assertAlmostEqual(L.likelihood_score_minkpp([flat], 100.0),
@@ -151,29 +132,26 @@ class GapKTest(unittest.TestCase):
 
 
 class MinTokensFloorTest(unittest.TestCase):
-    """--min-k-tokens: on short answers, k% alone floors to a single token (see
-    _bottom_k's max(1, int(n*k/100))), so one outlier z-score becomes the whole score.
-    min_tokens raises that floor to guarantee averaging over more than one token."""
 
     def test_short_answer_without_floor_uses_one_token(self):
-        # 3 tokens, k=20% -> max(1, int(3*0.2))=1 -> only the worst token, unaveraged.
+        # 토큰 3개에서 하위 20%는 최솟값 1개만 선택
         stats = [L.TokenStats(logp=-1.0, mu=0.0, sigma=1.0, top1=0.0),
                  L.TokenStats(logp=-2.0, mu=0.0, sigma=1.0, top1=0.0),
-                 L.TokenStats(logp=-9.0, mu=0.0, sigma=1.0, top1=0.0)]  # the outlier
+                 L.TokenStats(logp=-9.0, mu=0.0, sigma=1.0, top1=0.0)]  # 이상값
         self.assertAlmostEqual(L.likelihood_score_minkpp(stats, 20.0), -9.0)
 
     def test_min_tokens_floor_dilutes_the_outlier(self):
         stats = [L.TokenStats(logp=-1.0, mu=0.0, sigma=1.0, top1=0.0),
                  L.TokenStats(logp=-2.0, mu=0.0, sigma=1.0, top1=0.0),
                  L.TokenStats(logp=-9.0, mu=0.0, sigma=1.0, top1=0.0)]
-        # min_tokens=3 averages all three instead of just the worst one.
+        # 최솟값만 선택하지 않고 3개 모두 평균
         self.assertAlmostEqual(L.likelihood_score_minkpp(stats, 20.0, min_tokens=3),
                                (-1.0 - 2.0 - 9.0) / 3)
 
     def test_min_tokens_is_capped_to_available_tokens(self):
         stats = [L.TokenStats(logp=-1.0, mu=0.0, sigma=1.0, top1=0.0),
                  L.TokenStats(logp=-3.0, mu=0.0, sigma=1.0, top1=0.0)]
-        # min_tokens=5 requested but only 2 tokens exist -> averages both, not an error.
+        # 최소 5개 요청에도 실제 토큰 수 2개로 제한
         self.assertAlmostEqual(L.likelihood_score_minkpp(stats, 20.0, min_tokens=5), -2.0)
 
     def test_min_tokens_defaults_to_one_unbounded_selection(self):
@@ -198,9 +176,6 @@ class MinTokensFloorTest(unittest.TestCase):
 
 
 class ExpVariantTest(unittest.TestCase):
-    """minkpp_exp/gapk_exp: our fix for the raw-z/-g blow-up on teacher-forced answers
-    (see likelihood_score_minkpp_exp's docstring). Averages exp(z)/exp(g) instead of
-    the raw score, the same saturating trick likelihood_score already applies to logp."""
 
     def test_minkpp_exp_matches_exp_of_the_paper_formula_for_one_token(self):
         probs = [0.5, 0.2, 0.2, 0.1]
@@ -209,8 +184,6 @@ class ExpVariantTest(unittest.TestCase):
         self.assertAlmostEqual(L.likelihood_score_minkpp_exp([s], 100.0), math.exp(raw_z))
 
     def test_still_separates_equal_log_probs_by_distribution_shape(self):
-        """The same flat-vs-peaked case MinKppTest checks, through the exp(z) lens:
-        exp() is monotonic, so the ordering (and thus the separation) survives."""
         flat = stats_from_distribution([0.2] * 5, target=0)
         peaked = stats_from_distribution([0.6, 0.2, 0.1, 0.05, 0.05], target=1)
         self.assertAlmostEqual(flat.logp, peaked.logp)
@@ -218,17 +191,13 @@ class ExpVariantTest(unittest.TestCase):
                            L.likelihood_score_minkpp_exp([peaked], 100.0))
 
     def test_bounds_a_sigma_collapse_that_explodes_the_raw_score(self):
-        """The actual failure mode this fixes: teacher-forcing makes some token's
-        next-token distribution near-deterministic (sigma -> 0), so an otherwise
-        unremarkable logp produces a z of -50 to -1000+ under the raw formula. exp()
-        saturates that toward 0 instead of letting a mean over it explode."""
         normal = L.TokenStats(logp=-1.0, mu=0.0, sigma=1.0, top1=0.0)
-        collapsed = L.TokenStats(logp=-5.0, mu=-0.02, sigma=1e-4, top1=-0.01)  # z ~ -49800
+        collapsed = L.TokenStats(logp=-5.0, mu=-0.02, sigma=1e-4, top1=-0.01)  # z는 약 -49800
         raw = L.likelihood_score_minkpp([normal, collapsed], 100.0)
-        self.assertLess(raw, -1000)  # the blow-up, reproduced
+        self.assertLess(raw, -1000)  # 작은 표준편차에 따른 큰 음수 점수 확인
         bounded = L.likelihood_score_minkpp_exp([normal, collapsed], 100.0)
         self.assertGreaterEqual(bounded, 0.0)
-        self.assertLess(bounded, 1.0)  # both tokens score < 1 (worse than the mean token)
+        self.assertLess(bounded, 1.0)  # 두 토큰의 z가 음수이므로 exp(z)는 1 미만
 
     def test_gapk_exp_matches_exp_of_the_paper_formula(self):
         probs = [0.5, 0.2, 0.2, 0.1]
@@ -238,8 +207,6 @@ class ExpVariantTest(unittest.TestCase):
                                math.exp(raw_g))
 
     def test_gapk_exp_top1_token_scores_one(self):
-        """g_t=0 at the model's own top-1 token -> exp(0)=1, the gapk_exp analogue of
-        GapKTest.test_top1_token_scores_zero."""
         s = stats_from_distribution([0.5, 0.2, 0.2, 0.1], target=0)
         self.assertAlmostEqual(L.likelihood_score_gapk_exp([s], 100.0, window=1), 1.0)
 
@@ -261,11 +228,11 @@ class ParseAggregationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             L.parse_aggregation("minkpp")
         with self.assertRaises(ValueError):
-            L.parse_aggregation("gapk", k=20.0)  # window missing
+            L.parse_aggregation("gapk", k=20.0)  # 필수 window 누락
         with self.assertRaises(ValueError):
             L.parse_aggregation("minkpp_exp")
         with self.assertRaises(ValueError):
-            L.parse_aggregation("gapk_exp", k=20.0)  # window missing
+            L.parse_aggregation("gapk_exp", k=20.0)  # 필수 window 누락
         with self.assertRaises(ValueError):
             L.parse_aggregation("nope")
 

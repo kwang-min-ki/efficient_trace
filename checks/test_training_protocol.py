@@ -19,10 +19,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def tokenizer():
+    """템플릿 전달 검증용 소형 토크나이저 생성"""
     tok = PreTrainedTokenizerFast(tokenizer_object=Tokenizer(WordLevel({'[UNK]': 0},
                                   unk_token='[UNK]')), unk_token='[UNK]')
-    # Include newlines, both quote types and whitespace-control Jinja to exercise
-    # transport through Python -> shell NUL records -> Hydra -> Transformers.
+    # 줄바꿈·따옴표·Jinja 공백 제어가 Python → 셸 → Hydra → Transformers에서 보존되는지 검증
     tok.chat_template = "{% for m in messages %}{{ m['role'] + '\\n' + m['content'] }}{% endfor %}\n{% if add_generation_prompt %}{{ 'assistant\\n' }}{% endif %}"
     return tok
 
@@ -96,7 +96,7 @@ with open(os.environ['CAPTURE'], 'w') as f:
                 else:
                     self.assertEqual(values['trainer.total_training_steps'], 625)
                     self.assertEqual(values['data.truncation'], 'left')
-            # Invalid model profiles must never reach the trainer.
+            # 지원하지 않는 모델은 학습기 호출 전에 실패해야 함
             capture.unlink()
             (folder / 'config.json').write_text(json.dumps({'model_type': 'unknown'}))
             result = subprocess.run(['bash', 'train.sh'], cwd=ROOT, env=env, capture_output=True)

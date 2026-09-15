@@ -15,6 +15,7 @@ import reward
 
 
 def _progress(label, done, total, t0):
+    """처리 개수와 경과 시간 출력"""
     elapsed = time.time() - t0
     rate = done / elapsed if elapsed > 0 else 0
     eta = (total - done) / rate if rate > 0 else float("inf")
@@ -23,10 +24,9 @@ def _progress(label, done, total, t0):
 
 
 def load_model(model, dtype="bfloat16", tokenizer=None, thinking=True):
-    """tokenizer: override for checkpoints pushed without their own tokenizer files --
-    fine-tuning doesn't change the vocab, so pointing this at the base model is safe.
+    """HF 토크나이저·모델·설정 로딩
 
-    Also resolves the model profile from the checkpoint's own config (never its name).
+    체크포인트에 토크나이저가 없으면 tokenizer 인자로 별도 지정
     """
     tok = AutoTokenizer.from_pretrained(tokenizer or model)
     if tok.pad_token_id is None:
@@ -39,10 +39,7 @@ def load_model(model, dtype="bfloat16", tokenizer=None, thinking=True):
 
 
 def _cut_at_stop(text, stop):
-    """HF's StopStringCriteria stops only once a token completing the stop string has
-    been generated, so the decoded text includes it (and can overshoot it, e.g. a token
-    like "stopper" fulfilling "stop"). Truncate here so REOPEN[task] + o
-    reconstructs the text expected by reward parsing."""
+    """첫 중단 문자열부터 이후 텍스트 제거"""
     if not stop:
         return text
     idx = min((text.find(s) for s in stop if s in text), default=-1)
@@ -50,13 +47,11 @@ def _cut_at_stop(text, stop):
 
 
 class Generator:
-    """HF generation with `.tok`, `.model` (name string, for record
-    metadata), `.generate(prompts, n, temperature, max_tokens, stop) -> list[list[str]]`.
-    The actual `PreTrainedModel` lives on `.net` so it doesn't collide with `.model`.
-    Used for source rollouts, counterfactual labels, and CoT monitoring."""
+    """원본 응답·라벨·모니터에 사용하는 공통 HF 생성기"""
 
     def __init__(self, model, dtype="bfloat16", batch_size=16, tokenizer=None,
                  thinking=True, max_model_len=None):
+        """배치 크기 검증 후 모델·토크나이저와 입력 길이 한도 설정"""
         self.model = model
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
@@ -66,14 +61,15 @@ class Generator:
         self.max_model_len = max_model_len
         self.tok, self.net, self.profile = load_model(
             model, dtype, tokenizer=tokenizer, thinking=thinking)
-        self.tok.padding_side = "left"  # required so every row's next token is in the same column
+        self.tok.padding_side = "left"  # 입력별 마지막 토큰 위치를 맞추기 위한 왼쪽 패딩
 
     def render(self, records):
-        """Dataset records -> model input strings, via this checkpoint's template."""
+        """모델 고유 대화 템플릿으로 입력 레코드를 문자열로 변환"""
         return model_config.render_records(self.tok, records, self.profile)
 
     @torch.inference_mode()
     def generate(self, prompts, n=1, temperature=0.7, max_tokens=1024, stop=None):
+        """입력별 n개 응답을 배치 생성해 입력 순서의 중첩 리스트로 반환"""
         if not prompts:
             return []
         out = [None] * len(prompts)
@@ -89,7 +85,7 @@ class Generator:
             enc = {k: v.to(self.net.device) for k, v in enc.items()}
             kwargs = dict(**enc, max_new_tokens=max_tokens, num_return_sequences=n,
                           use_cache=True)
-            # Preserve all EOS/pad IDs from the checkpoint's generation_config.
+            # 체크포인트에서 지정한 모든 종료·패딩 ID 유지
             kwargs.update(model_config.sampling_kwargs(
                 self.profile, temperature, backend="hf",
                 tokenizer=self.tok, config_or_model=self.net))
@@ -99,7 +95,7 @@ class Generator:
             gen_only = seq[:, enc["input_ids"].shape[1]:]
             texts = self.tok.batch_decode(gen_only, skip_special_tokens=True)
             for i in range(len(batch)):
-                # repeat_interleave order: row i's n samples are contiguous at [i*n:(i+1)*n]
+                # 입력 i의 응답 n개는 [i*n:(i+1)*n]에 연속 배치
                 out[start + i] = [_cut_at_stop(texts[i * n + j], stop) for j in range(n)]
             _progress("rollout", min(start + self.batch_size, len(prompts)), len(prompts), t0)
         return out
@@ -107,26 +103,11 @@ class Generator:
 
 def rollout_and_filter(gen, samples, task, targets, temperature=protocol.ROLLOUT_TEMPERATURE,
                        source_records=None, progress_label="rollout"):
-    """Prepare `kept` responses (generate one rollout per sample,
-    keep only responses that both have a non-empty CoT and obtain proxy reward 1.0; Sec.
-    4.1: "only responses that obtain a reward of 1 are scored"). Also extracts
-    `answer_text`, the string likelihood_trace.py teacher-forces at every cutoff.
+    """응답 생성 또는 재사용 후 보상 1·비어 있지 않은 추론만 선택
 
-    `prefix_before_cot` is the exact text preceding the reasoning span: the rendered
-    prompt, plus any generated `<think>` marker when there is one. Both HF
-    scorers tokenize that -- not the raw dataset prompt -- so the cutoff denominator is
-    reasoning tokens only.
-
-    `source_records` reuses previously written responses (matched by pid) instead of
-    generating new ones. Two reasons it matters
-    for math/code: the rollout is 92-98% of a run's wall clock while scoring is 20-75s,
-    and it is *sampled* (ROLLOUT_TEMPERATURE=0.7), so re-generating per --aggregation
-    both pays that cost again and lands on a different `kept` population -- comparisons
-    across aggregations then mix the aggregation's effect with sampling noise. Reusing
-    records keeps the sampled-rollout protocol intact while making those comparisons
-    exactly paired. The caller must pass the same `samples` the records came from;
-    pids present in `samples` but absent from the records are reported as
-    `missing_record` rather than silently dropped.
+    source_records는 pid로 연결, 없는 ID는 missing_record로 집계
+    반환 레코드에 답과 추론 직전의 정확한 접두사 포함
+    동일 응답 비교를 위해 같은 모델·데이터 조건의 records 사용 필요
     """
     max_response = gen.profile.max_response_tokens(task)
     prompts = gen.render(samples)
@@ -145,9 +126,7 @@ def rollout_and_filter(gen, samples, task, targets, temperature=protocol.ROLLOUT
         responses = [by_pid.get(s["pid"], {}).get("response") for s in samples]
         source = "records"
 
-    # Reasoning-span parsing is cheap and sequential; reward.proxy for code shells out
-    # to run_tests's subprocess.run, which blocks on the child process and releases the
-    # GIL, so a thread pool parallelizes it across samples (see protocol.REWARD_WORKERS).
+    # 추론 분리는 순차 처리, 자식 프로세스를 기다리는 코드 채점은 스레드로 병렬화
     parseable = []
     missing_record = no_reasoning = 0
     for s, prompt, response in zip(samples, prompts, responses):
@@ -186,20 +165,14 @@ def rollout_and_filter(gen, samples, task, targets, temperature=protocol.ROLLOUT
     return kept
 
 
-# ---------------------------------------------------------------------------
-# Hand-rolled KV-prefix caching shared by trace.py and likelihood_trace.py.
-# ---------------------------------------------------------------------------
 
 def cutoff_tok_len(n_cot_tokens, frac):
-    """Compute each token cutoff directly
-    instead of encode->slice->decode->(re-encode later) -- this guarantees each
-    cutoff's tokens are an exact prefix of the next-longer cutoff's tokens, which is
-    what makes reusing one KV cache across cutoffs valid at all."""
+    """추론 토큰 수와 비율로 절단 위치 계산, 재토큰화 없이 캐시 위치 유지"""
     return max(1, math.ceil(n_cot_tokens * frac))
 
 
 def clone_cache(cache):
-    """Copy mutable layer tensors so cutoff branches cannot alter the base cache."""
+    """절단점별 변경이 원본 캐시에 영향을 주지 않도록 텐서 복사"""
     new = DynamicCache()
     for layer in cache.layers:
         nl = DynamicLayer()
@@ -213,7 +186,7 @@ def clone_cache(cache):
 
 
 def _build_prefix_cache(net, full_ids):
-    """One forward pass over prompt+full_cot, filling a KV cache for every position."""
+    """프롬프트와 전체 추론을 한 번 계산해 위치별 KV 캐시 생성"""
     cache = DynamicCache(config=net.config)
     net(
         input_ids=torch.tensor([full_ids], device=net.device),
@@ -224,7 +197,7 @@ def _build_prefix_cache(net, full_ids):
 
 
 def _longest_common_prefix_len(left, right):
-    """Number of leading token IDs shared by two independently tokenized texts."""
+    """두 토큰 ID 목록의 공통 접두사 길이 반환"""
     common = 0
     while common < len(left) and common < len(right) and left[common] == right[common]:
         common += 1
@@ -232,10 +205,7 @@ def _longest_common_prefix_len(left, right):
 
 
 def _cutoff_attention_mask(target_lens, L, tail_len, device):
-    """(len(target_lens), L + tail_len) mask: row j sees cached positions
-    [0, target_lens[j]) and all of the tail_len new positions appended after L.
-    Row j's target_lens[j] <= L always (cutoff_tok_len never exceeds the CoT length),
-    so this only ever hides a *suffix* of the cached prefix, never the tail."""
+    """각 행의 절단점 이후 캐시를 가리고 새 입력은 유지하는 마스크 생성"""
     n = len(target_lens)
     mask = torch.zeros(n, L, dtype=torch.long, device=device)
     for j, tl in enumerate(target_lens):
@@ -246,20 +216,14 @@ def _cutoff_attention_mask(target_lens, L, tail_len, device):
 
 
 def _eos_ids(tok, net):
-    """Every stop token this checkpoint declares."""
+    """체크포인트 설정의 모든 종료 토큰 ID 반환"""
     return set(model_config.resolve_generation_token_ids(tok, net).eos)
 
 
 def _filter_logits(logits, sampling):
-    """Apply top-k / top-p / min-p to already-temperature-scaled logits.
+    """온도로 조정된 logits에 top-k, top-p, min-p 순서로 필터 적용
 
-    `model.generate` applies these through LogitsProcessors, but this decoder drives
-    `forward()` by hand (see the docstring below), so the same filtering has to be
-    applied here or the two HF paths would silently sample from different
-    distributions. Order matches transformers' default warper order: top-k, then
-    top-p, then min-p. With the experiment protocol's settings (top_k=0, top_p=1.0,
-    min_p=0.0) every branch is a no-op, so this is exact for the current protocol and
-    correct if the profile ever changes.
+    직접 구현한 캐시 생성에서도 HF 생성과 같은 필터 설정 사용
     """
     if sampling is None:
         return logits
@@ -270,8 +234,7 @@ def _filter_logits(logits, sampling):
     if sampling.top_p is not None and sampling.top_p < 1.0:
         ordered, order = torch.sort(logits, dim=-1, descending=True)
         probs = ordered.softmax(dim=-1)
-        # Drop the tail whose cumulative mass *before* this token already covers top_p,
-        # always keeping the single most likely token.
+        # top-p를 넘는 누적 확률의 꼬리 제거, 최상위 토큰은 항상 유지
         drop = (probs.cumsum(dim=-1) - probs) > sampling.top_p
         drop[:, 0] = False
         logits = logits.masked_fill(drop.scatter(1, order, drop), float("-inf"))
@@ -285,19 +248,10 @@ def _filter_logits(logits, sampling):
 @torch.inference_mode()
 def _decode_from_cache_masked(tok, net, branch, attn_mask_base, start_ids, start_positions,
                               max_new_tokens, temperature, stop, sampling=None):
-    """Hand-rolled autoregressive decode against a pre-filled, masked `branch` cache
-    (batch B): row b starts at absolute position `start_positions[b]` (its cutoff
-    boundary) rather than after the full cache, via explicit `position_ids` -- the
-    cache tensor itself is never cropped, `attn_mask_base` (B, L) is what makes each
-    row only "see" cached positions [0, start_positions[b]). Every decode step
-    advances all B rows together in one forward call (instead of trace_curve_cached
-    looping per cutoff), so the B = len(fracs)*n_samples rows here typically cover
-    every cutoff of one sample at once. We manage `attention_mask`/`position_ids` by
-    hand (not `model.generate(past_key_values=...)`) because that path mishandles a
-    pre-filled cache combined with a short new attention_mask (confirmed by a live
-    crash: 0-length reshape a few decode steps in) -- forward() is the primitive
-    already proven correct for pre-filled caches (likelihood_curve_cached).
-    Returns a list of B decoded strings, stop text excluded.
+    """마스크된 접두사 캐시에서 배치별 답 토큰 생성
+
+    캐시는 자르지 않고 attention_mask와 position_ids로 절단 위치 지정
+    각 행을 함께 생성하며 중단 문자열을 제외한 문자열 목록 반환
     """
     B = start_ids.shape[0]
     F = start_ids.shape[1]
@@ -306,15 +260,13 @@ def _decode_from_cache_masked(tok, net, branch, attn_mask_base, start_ids, start
     generated = [[] for _ in range(B)]
     finished = [False] * B
     do_sample = bool(temperature and temperature > 0)
-    # Decoding only the last WINDOW tokens each step
-    # (instead of the whole, ever-growing `generated[b]`) keeps the per-step
-    # stop-check O(1) instead of O(step).
+    # 중단 문자열 검사를 최근 16개 토큰으로 제한해 반복 디코딩 비용 절감
     WINDOW = 16
 
     attn_mask = attn_mask_base
     cur_input = start_ids
     cur_pos = start_positions.unsqueeze(1) + torch.arange(F, device=device).unsqueeze(0)
-    next_pos = start_positions + F  # absolute position of the next token to generate, per row
+    next_pos = start_positions + F  # 각 행에서 다음에 생성할 토큰의 절대 위치
 
     for _ in range(max_new_tokens):
         attn_mask = torch.cat(
@@ -354,17 +306,10 @@ def _decode_from_cache_masked(tok, net, branch, attn_mask_base, start_ids, start
 
 def trace_curve_cached(tok, net, prompt_ids, cot_ids, force_ids, fracs, n_samples, temperature,
                        max_new_tokens, stop, sampling=None):
-    """TRACE for one sample: 1 forward pass builds a KV cache over prompt+full_cot,
-    then ALL len(fracs) cutoffs are decoded together in ONE batched loop (batch =
-    len(fracs) * n_samples; row i belongs to cutoff i // n_samples), using the same
-    masking approach as likelihood_curve_cached, instead of looping over cutoffs and
-    cropping the cache for each. Autoregressive decoding itself still needs up to
-    max_new_tokens sequential forward calls -- that dependency can't be removed, it's
-    the actual TRACE-vs-likelihood-TRACE difference this reimplements -- but all
-    len(fracs)*n_samples rows now advance together each step instead of len(fracs)
-    separate small-batch loops, removing the same per-cutoff call overhead
-    likelihood_curve_cached's batching removes.
-    Returns a list of per-cutoff list-of-n_samples decoded strings, in `fracs` order.
+    """전체 추론 캐시를 공유해 모든 절단점의 답을 배치 생성
+
+    배치 크기는 len(fracs) * n_samples, 답 생성은 토큰별 순차 진행
+    fracs 순서로 절단점별 n_samples개 답 반환
     """
     full_ids = prompt_ids + cot_ids
     L = len(full_ids)
@@ -374,7 +319,7 @@ def trace_curve_cached(tok, net, prompt_ids, cot_ids, force_ids, fracs, n_sample
 
     cache = _build_prefix_cache(net, full_ids)
     branch = clone_cache(cache)
-    branch.batch_repeat_interleave(B)  # all B rows start as identical copies of the base cache
+    branch.batch_repeat_interleave(B)  # 모든 배치 행에 독립적인 원본 캐시 복사본 사용
 
     target_lens = [len(prompt_ids) + cutoff_tok_len(len(cot_ids), f) for f in fracs]
     row_target_lens = [target_lens[i // n_samples] for i in range(B)]

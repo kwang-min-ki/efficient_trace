@@ -13,11 +13,12 @@ from data import read_jsonl, targets_for, write_jsonl
 from generation import Generator, rollout_and_filter, trace_curve_cached
 
 
-# ---------------------------------------------------------------------------
-# Math/code autoregressive TRACE orchestration and CLI.
-# ---------------------------------------------------------------------------
 
 def score(gen, samples, task, targets, source_records=None):
+    """응답 생성·필터링 후 절단점별 답 재생성과 보상 곡선 계산
+
+    결과 레코드, 원본 응답 준비 시간, 채점 시간 반환
+    """
     config = protocol.TASK_CFG[task]
     n_samples, temp, ans_tokens = (
         config["n_samples"], config["temp"], config["ans_tokens"]
@@ -35,8 +36,7 @@ def score(gen, samples, task, targets, source_records=None):
     records = []
     for n, k in enumerate(kept, 1):
         s = k["sample"]
-        # prefix_before_cot, not the dataset prompt: it carries the rendered chat
-        # template and any generated <think>, so cot_ids is reasoning only.
+        # 대화 템플릿과 시작 태그를 접두사에 두고 순수 추론 토큰만 절단
         prompt_ids = gen.tok.encode(k["prefix_before_cot"], add_special_tokens=False)
         cot_ids = gen.tok.encode(k["cot"], add_special_tokens=False)
         per_cutoff_outs = trace_curve_cached(
@@ -52,10 +52,9 @@ def score(gen, samples, task, targets, source_records=None):
             protocol.STOP[task],
             sampling=gen.profile.sampling,
         )
-        # per_cutoff_outs' decoding is already batched on GPU; scoring each cutoff still
-        # calls reward.expected, which for code blocks on run_tests's subprocess.run --
-        # parallelize those len(FRACS) independent, GIL-releasing calls across threads.
+        # 코드 테스트는 별도 프로세스에서 실행되므로 절단점별 보상 채점을 스레드로 병렬화
         def _score_cutoff(item):
+            """한 절단점에서 생성한 답들의 평균 보상 계산"""
             j, outs = item
             texts = [protocol.REOPEN[task] + o for o in outs]
             return j, reward.expected(task, texts, targets[s["pid"]], s["loophole"])
@@ -83,6 +82,7 @@ def score(gen, samples, task, targets, source_records=None):
 
 
 def main():
+    """TRACE 평가 옵션 해석 후 점수·실행 통계 저장"""
     ap = argparse.ArgumentParser()
     ap.add_argument("--task", choices=["math", "code"], required=True)
     ap.add_argument("--data", required=True)

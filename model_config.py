@@ -18,40 +18,32 @@ from typing import Any
 THINK_START = "<think>"
 THINK_END = "</think>"
 
-# Qwen2.5 has no native thinking mode, so the original experiments opened the
-# reasoning block for it by prefilling the assistant turn.
+# 추론 시작 태그를 assistant 접두사로 제공
 LEGACY_ASSISTANT_PREFILL = "Let me solve this step by step.\n<think>"
 
 TASKS = ("math", "code")
 
 
 class ModelFamily(str, Enum):
-    """Supported text-model families (Qwen2 also covers Qwen2.5)."""
+    """지원하는 모델 계열, Qwen2에 Qwen2.5 포함"""
 
     QWEN2 = "qwen2"
     LLAMA = "llama"
 
     def __str__(self) -> str:
+        """모델 계열의 문자열 값 반환"""
         return self.value
 
 
 class UnsupportedModelError(ValueError):
-    """Raised when a checkpoint is not one of the supported model families."""
+    """지원하지 않는 모델 계열의 설정 오류"""
 
 
 @dataclass(frozen=True)
 class SamplingSettings:
-    """Nucleus/top-k settings shared by every backend.
+    """생성 경로에서 공유하는 top-p·top-k·min-p 설정
 
-    Temperature is intentionally absent: it is a per-task protocol value owned by
-    ``protocol.TASK_CFG``, not a model property.  These fields only pin the filtering
-    distribution so the vLLM, ``model.generate``, and hand-rolled cache samplers all
-    draw from the same one.
-
-    ``top_k=0`` disables top-k filtering and ``min_p=0`` disables min-p filtering in
-    both Transformers and vLLM, so one set of values is valid for either backend.
-    (vLLM still "quietly accepts -1 as disabled" for historical reasons, but 0 is the
-    spelling it documents and defaults to; sampling_params.py: SamplingParams.)
+    온도는 모델 속성과 분리해 호출부에서 전달
     """
 
     top_p: float
@@ -59,19 +51,20 @@ class SamplingSettings:
     min_p: float = 0.0
 
     def as_kwargs(self) -> dict[str, Any]:
+        """샘플링 필터 설정을 키워드 인자 사전으로 반환"""
         return {"top_p": self.top_p, "top_k": self.top_k, "min_p": self.min_p}
 
-    # Backend-named aliases kept so call sites read explicitly at the boundary.
+    # 호출부에서 생성 엔진을 명시할 수 있도록 별칭 제공
     hf_kwargs = as_kwargs
     vllm_kwargs = as_kwargs
 
 
-# The math/code protocol uses plain temperature without nucleus/top-k truncation.
+# 현재 실험은 온도만 적용하고 top-p·top-k·min-p 필터 비활성화
 PROTOCOL_SAMPLING = SamplingSettings(top_p=1.0, top_k=0, min_p=0.0)
 
 
-# Controlled comparison budgets inherited from the Qwen2.5 TRACE baseline.
-# Llama truncation rates still need measurement.
+# Qwen2.5 기준 응답 예산으로 비교 조건 통일
+# Llama의 추론 잘림 비율은 별도 확인 필요
 RESPONSE_BUDGETS: dict[ModelFamily, dict[str, int]] = {
     ModelFamily.QWEN2: {"math": 1024, "code": 600},
     ModelFamily.LLAMA: {"math": 1024, "code": 600},
@@ -80,7 +73,7 @@ RESPONSE_BUDGETS: dict[ModelFamily, dict[str, int]] = {
 
 @dataclass(frozen=True)
 class ModelProfile:
-    """All behavior that differs between the supported model families."""
+    """모델 계열별 추론 접두사·응답 예산·샘플링 설정"""
 
     family: ModelFamily
     thinking: bool
@@ -90,11 +83,11 @@ class ModelProfile:
 
     @property
     def chat_template_kwargs(self) -> dict[str, bool]:
-        # Supported templates do not define a native thinking switch.
+        """지원 템플릿에 별도 thinking 옵션 없이 빈 사전 반환"""
         return {}
 
     def max_response_tokens(self, task: str) -> int:
-        """Rollout budget for ``task`` -- one of ``TASKS``."""
+        """도메인의 응답 토큰 한도 반환"""
         try:
             return self.response_budget[task]
         except KeyError:
@@ -105,18 +98,20 @@ class ModelProfile:
 
 @dataclass(frozen=True)
 class GenerationTokenIds:
-    """Resolved generation IDs, sourced from the loaded objects rather than literals."""
+    """로드된 모델·토크나이저에서 결정한 종료·패딩 토큰 ID"""
 
     eos: tuple[int, ...]
     pad: int | None
 
     @property
     def eos_for_backend(self) -> int | list[int] | None:
+        """종료 토큰 수에 따라 None, 단일 ID 또는 목록 반환"""
         if not self.eos:
             return None
         return self.eos[0] if len(self.eos) == 1 else list(self.eos)
 
     def hf_kwargs(self) -> dict[str, Any]:
+        """HF 생성에 전달할 종료·패딩 토큰 인자 구성"""
         result: dict[str, Any] = {}
         eos = self.eos_for_backend
         if eos is not None:
@@ -128,12 +123,10 @@ class GenerationTokenIds:
 
 @dataclass(frozen=True)
 class ResponseParts:
-    """A generated response split at its closing thinking marker.
+    """응답을 추론 접두사·추론·답으로 나눈 결과
 
-    ``prefix_before_cot + reasoning + THINK_END + after_think`` reconstructs the
-    original prompt and response.  Any generated ``<think>`` marker
-    lives in ``prefix_before_cot`` rather than contaminating the token-ratio CoT
-    cutoffs used by TRACE, so both families measure cutoffs over reasoning text only.
+    prefix_before_cot + reasoning + THINK_END + after_think로 원문 복원
+    생성된 think 시작 태그는 추론 길이에 포함하지 않고 접두사에 보관
     """
 
     prefix_before_cot: str
@@ -143,6 +136,7 @@ class ResponseParts:
 
     @property
     def cot(self) -> str:
+        """추론 텍스트 반환"""
         return self.reasoning
 
 
@@ -169,7 +163,7 @@ _FAMILY_ALIASES = {
 
 
 def family_from_model_type(model_type: str) -> ModelFamily:
-    """Map an AutoConfig ``model_type`` to an experiment model family."""
+    """AutoConfig의 model_type을 지원 모델 계열로 변환"""
 
     if not isinstance(model_type, str) or not model_type.strip():
         raise UnsupportedModelError("config.model_type must be a non-empty string")
@@ -184,6 +178,7 @@ def family_from_model_type(model_type: str) -> ModelFamily:
 
 
 def _config_model_type(config: Any) -> str:
+    """사전 또는 설정 객체에서 model_type 추출"""
     if isinstance(config, Mapping):
         model_type = config.get("model_type")
     else:
@@ -198,11 +193,7 @@ def detect_model_family(
     *,
     config_kwargs: Mapping[str, Any] | None = None,
 ) -> ModelFamily:
-    """Detect a family from AutoConfig, loading it lazily for a model path/name.
-
-    A checkpoint name is never parsed heuristically: renamed and merged checkpoints
-    stay correct because their ``config.model_type`` is authoritative.
-    """
+    """체크포인트 이름 대신 AutoConfig의 model_type으로 계열 판별"""
 
     if isinstance(model_or_config, (str, os.PathLike)):
         from transformers import AutoConfig
@@ -220,7 +211,7 @@ def profile_for_family(
     *,
     thinking: bool = True,
 ) -> ModelProfile:
-    """Return an immutable profile; thinking defaults explicitly to enabled."""
+    """모델 계열의 불변 설정 반환, 기본 thinking 활성화"""
 
     if not isinstance(thinking, bool):
         raise TypeError("thinking must be a bool")
@@ -236,7 +227,7 @@ def get_model_profile(
     thinking: bool = True,
     config_kwargs: Mapping[str, Any] | None = None,
 ) -> ModelProfile:
-    """Detect and build a profile from the checkpoint configuration."""
+    """체크포인트 설정에서 모델 계열을 판별해 실행 설정 구성"""
 
     profile = profile_for_family(
         detect_model_family(model_or_config, config_kwargs=config_kwargs),
@@ -245,7 +236,6 @@ def get_model_profile(
     return profile
 
 
-# Descriptive alias for callers that treat profile resolution as model loading setup.
 resolve_model_profile = get_model_profile
 
 
@@ -254,6 +244,7 @@ def _coerce_profile(
     tokenizer: Any,
     thinking: bool | None,
 ) -> ModelProfile:
+    """설정 객체·계열·경로 입력을 ModelProfile로 통일"""
     if isinstance(profile_or_family, ModelProfile):
         return (
             profile_or_family
@@ -288,11 +279,7 @@ def render_chat_prompt(
     thinking: bool | None = None,
     legacy_assistant_prefill: bool | None = None,
 ) -> str:
-    """Render the checkpoint's own template plus its assistant generation prompt.
-
-    ``legacy_assistant_prefill`` defaults to the profile's setting: enabled for
-    Qwen2.5 and Llama, which have no native thinking mode.
-    """
+    """모델 고유 대화 템플릿과 필요한 추론 시작 접두사로 입력 구성"""
 
     profile = _coerce_profile(profile_or_family, tokenizer, thinking)
     prefill = profile.legacy_prefill if legacy_assistant_prefill is None else legacy_assistant_prefill
@@ -308,7 +295,6 @@ def render_chat_prompt(
     return rendered + LEGACY_ASSISTANT_PREFILL if prefill else rendered
 
 
-# Short alias useful at dataset call sites.
 render_prompt = render_chat_prompt
 
 
@@ -317,27 +303,20 @@ def render_records(
     records: Sequence[Mapping[str, Any]],
     profile: ModelProfile,
 ) -> list[str]:
-    """Render dataset records (which carry ``messages``) into model input strings.
-
-    Dataset files store a model-neutral ``prompt`` for artifacts and clustering; the
-    actual model input is always rendered here, with the tokenizer that will run.
-    """
+    """각 레코드의 messages를 모델 입력 문자열로 변환"""
 
     return [render_chat_prompt(tokenizer, record["messages"], profile) for record in records]
 
 
-# The historical math/code split point: the FIRST closing marker.
 def split_reasoning_response(
     response: str,
     *,
     prompt: str = "",
     family: ModelFamily | str | None = None,
 ) -> ResponseParts | None:
-    """Split at ``</think>`` and move any generated opening marker into the prefix.
+    """첫 think 종료 태그를 기준으로 추론과 답 분리
 
-    ``None`` denotes the malformed-response case previously represented by a missing
-    close marker. Opening-marker handling tolerates both prefilled and generated
-    markers so ``reasoning`` contains reasoning text only.
+    생성된 시작 태그는 접두사로 이동해 추론 토큰 비율에서 제외
     """
 
     if not isinstance(response, str) or not isinstance(prompt, str):
@@ -371,6 +350,7 @@ split_response = split_reasoning_response
 
 
 def _normalize_ids(value: Any) -> tuple[int, ...]:
+    """종료·패딩 ID 입력을 중복 없는 정수 튜플로 변환"""
     if value is None:
         return ()
     values = value if isinstance(value, (list, tuple, set)) else (value,)
@@ -391,12 +371,10 @@ def resolve_generation_token_ids(
     tokenizer: Any,
     config_or_model: Any | None = None,
 ) -> GenerationTokenIds:
-    """Resolve EOS/padding IDs from actual generation, model, and tokenizer config.
+    """모델·토크나이저 설정에서 종료·패딩 ID 결정
 
-    Runtime ``generation_config`` has precedence for EOS and can declare multiple
-    stop tokens. Padding prefers the tokenizer because it owns batch construction, then falls
-    back to model config and finally the first resolved EOS token.  No family-specific
-    numeric ID is assumed anywhere.
+    EOS는 generation_config 우선, 패딩은 토크나이저 우선
+    패딩 설정이 없으면 첫 EOS 사용
     """
 
     generation_config = getattr(config_or_model, "generation_config", None)
@@ -430,16 +408,14 @@ def sampling_kwargs(
     tokenizer: Any | None = None,
     config_or_model: Any | None = None,
 ) -> dict[str, Any]:
-    """Backend-correct decoding kwargs: protocol temperature + profile filtering.
+    """온도·모델 설정을 HF 또는 vLLM 생성 인자로 변환
 
-    ``temperature <= 0`` means greedy; the filtering settings are still returned for
-    vLLM (which ignores them at temperature 0) but ``do_sample=False`` is set for HF.
+    HF에서 온도가 0 이하면 do_sample=False 적용
     """
 
     sampling = profile.sampling
     if backend == "vllm":
-        # vLLM forces greedy filtering itself when temperature < eps; passing the
-        # values anyway keeps one code path.
+        # vLLM은 온도가 0이면 greedy 처리를 내부 적용
         return {"temperature": temperature, **sampling.vllm_kwargs()}
     if backend != "hf":
         raise ValueError("backend must be 'hf' or 'vllm'")
@@ -460,11 +436,7 @@ def verl_hydra_overrides(
     task: str | None = None,
     thinking: bool = True,
 ) -> list[str]:
-    """Return the verl overrides that depend on the model, and nothing else.
-
-    The response budget depends on the model. Rollout sampling is intentionally
-    left at verl's defaults so the training distribution stays a protocol constant.
-    """
+    """모델별 응답 토큰 한도를 verl 옵션으로 변환, 학습 샘플링은 기본값 유지"""
 
     if isinstance(model_or_profile, ModelProfile):
         profile = replace(model_or_profile, thinking=thinking)
@@ -482,10 +454,9 @@ def verl_hydra_overrides(
 
 
 def training_chat_template(tokenizer: Any, profile: ModelProfile) -> str:
-    """Append the evaluation prefill without modifying/saving the base tokenizer.
+    """평가와 같은 추론 접두사를 학습 템플릿에 추가
 
-    Passed as apply_chat_template(chat_template=...) by both verl's dataset
-    length filter and rollout agent. No assistant end-of-turn token is inserted.
+    원본 토크나이저는 변경하지 않고 assistant 종료 토큰도 추가하지 않음
     """
     template = tokenizer.get_chat_template()
     if not profile.legacy_prefill:
@@ -496,13 +467,14 @@ def training_chat_template(tokenizer: Any, profile: ModelProfile) -> str:
 
 
 def hydra_string(value: str) -> str:
-    """Quote for Hydra: escape quotes and adjacent slashes, keep Jinja's \n."""
+    """줄바꿈을 유지하며 Hydra 문자열의 따옴표·역슬래시 이스케이프"""
     escaped = re.sub(r'(\\*)"', lambda m: "\\" * (2 * len(m[1]) + 1) + '"', value)
     trailing = len(escaped) - len(escaped.rstrip("\\"))
     return '"' + escaped + "\\" * trailing + '"'
 
 
 def _main() -> None:
+    """학습용 모델 옵션·대화 템플릿을 CLI에서 출력"""
     parser = argparse.ArgumentParser(
         description="Emit model-family-specific settings for the training driver"
     )
