@@ -215,21 +215,18 @@ python detect.py cluster --records "$RUN/trace_hacking.jsonl" \
 
 현재 RLOO 학습 설정:
 
-| 설정 | Math | Code IC | Code RM |
-| --- | --- | --- | --- |
-| 입력 배치 / 문제당 생성 수 | 1024 / 5 | 16 / 2 | 16 / 2 |
-| 입력 / 응답 토큰 한도 | 512 / 1024 | 1300 / 600 | 512 / 600 |
-| 학습률 | 1e-6 | 1e-4 | 1e-4 |
-| KL 계수 | 0.001 | 0.01 | 0.001 |
-| 긴 입력 처리 | 필터링 | 왼쪽 절단 | 왼쪽 절단 |
-| LoRA rank / alpha | 미사용 | 16 / 32 | 16 / 32 |
-| 학습 기간 | 15 epochs | 625 updates | 625 updates |
+| 설정 | Math | Code |
+| --- | --- | --- |
+| 입력 배치 / 문제당 생성 수 | 1024 / 5 | 16 / 2 |
+| 입력 / 응답 토큰 한도 | 512 / 1024 |  512(RM)&1300(IC) / 600 |
+| 학습률 | 1e-6 | 1e-4 |
+| KL 계수 | 0.001 | 0.001 (RM)&0.01 (IC) |
+| 긴 입력 처리 | 필터링 | 왼쪽 절단 |
+| LoRA rank / alpha | 미사용 | 16 / 32 |
+| 학습 기간 | 15 epochs | 625 updates |
 
 - LoRA dropout 0.05 미설정 / Code 왼쪽 절단: assistant 접두사 보존 목적
-- PDF 결과표의 학습 step: Math IC 50(Qwen2.5-7B는 100), 나머지 조건 100 — 위 STEP=10 실행 예시와 구분
-- “Total Episodes” 해석: math 15 epochs, code 10,000문제 ÷ 배치 16 = 625 updates
-  - Code의 `total_epochs=10000`: 외부 반복 상한
-  - 원 구현과 일치 여부 미확인 가정 / 기간 변경: `trainer.total_epochs`, `trainer.total_training_steps`
+- 학습 step: Math IC 50(Qwen2.5-7B는 100), 나머지 조건 100
 - 학습 샘플링·미지정 항목: verl 기본값
 
 </details>
