@@ -18,6 +18,7 @@ data.py → 학습 parquet → train.sh → 체크포인트 병합
 ```
 
 기본 모델이나 병합된 체크포인트 보유 시 학습 생략 가능
+
 학습: verl + vLLM / 평가 및 라벨링: Hugging Face Transformers(HF)
 
 | 파일 | 역할 |
