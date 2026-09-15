@@ -1,12 +1,12 @@
 # Efficient TRACE
 
-**목표:** 수학·코드 문제에서 추론(CoT)에 숨은 보상 해킹 탐지 -> 탐지 성능과 계산 비용의 개선
+**목표:** 수학/코드 도메인에서 추론(CoT)에 숨은 보상 해킹 탐지 → 성능/비용 효율 높임
 
-- **보상 해킹:** 실제 문제 해결 대신 입력 힌트(IC)·채점 규칙의 허점(RM)을 이용한 보상 획득
-- **TRACE:** 추론을 여러 길이로 자른 뒤 답 재생성·채점
+- **보상 해킹:** 실제 문제 해결 대신 입력 힌트(IC)과 채점 규칙의 허점(RM)을 이용한 보상 획득
+- **TRACE:** 추론을 여러 길이로 자른 뒤 답 재생성 및 채점
 - **Efficient TRACE:** 각 추론 뒤에 기존 답을 입력하는 teacher forcing → 토큰 점수 정규화 → 낮은 점수의 k% 토큰 평균(Min-K%++) → 추론 길이별 곡선을 AUC로 요약
-- **핵심 가정:** 편법에 의존한 답은 짧은 추론만으로도 예측 가능 — 높은 점수를 탐지 신호로 활용
-- **비교:** 같은 응답·추론 절단점·캐시 구현에서 F1·precision·recall과 채점 시간 측정
+- **핵심 가정:** 편법에 의존한 답은 짧은 추론만으로도 예측 가능하기 때문에 초반부터 높은 점수를 탐지 신호로 활용
+- **비교:** 같은 응답/캐시 구현에서 F1/시간 측정
 - **실행:** `trace.py`(TRACE) / `likelihood_trace.py --aggregation minkpp`(Efficient TRACE)
 
 ## 1. 실행 흐름과 파일 역할
@@ -15,11 +15,10 @@
 data.py → 학습 parquet → train.sh → 체크포인트 병합
         → 평가 JSONL                     ↓
                         trace.py / likelihood_trace.py → detect.py
-                        응답·점수 저장                    라벨·F1·클러스터
 ```
 
-기본 모델·병합된 체크포인트 보유 시 학습 생략 가능
-학습: verl + vLLM / 평가·라벨링: Hugging Face Transformers(HF)
+기본 모델이나 병합된 체크포인트 보유 시 학습 생략 가능
+학습: verl + vLLM / 평가 및 라벨링: Hugging Face Transformers(HF)
 
 | 파일 | 역할 |
 | --- | --- |
