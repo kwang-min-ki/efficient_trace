@@ -172,22 +172,17 @@ done
 | 변경 | 설정 |
 | --- | --- |
 | 모델·체크포인트 | `MODEL` / `--model`, 결과 경로 분리 |
-| code 전체 실험 | 학습 `TASK=code`, 평가 `--task code --data data/code --split train,val,heldout` |
 | RM 실험 | 학습 `VARIANT=rm`, 평가 `--variant rm`, 라벨 `--kind rm`; 기준·대조 모델에도 같은 평가 조건 |
-| code RM clean 대조군 | `CODE_SETTING=rm TASK=code VARIANT=clean ./train.sh` — 기본 clean은 IC 설정 |
 | 부분 허점 데이터 | `data.py --task math --out <새 경로> --partial ic` 또는 `--partial rm`; 학습 `DATA`·평가 `--data` 변경 |
 | 답 앞부분만 채점 | `--score-window first_1` — 기본 `full` |
-| 집계 비교 | 같은 `--records`, 다른 `--aggregation`; 방법별 baseline 재채점 |
-| 새 모델 계열 | `model_config.py`의 판별·프로필·예산과 검증 추가 |
+| Likelihood 집계 비교 | 같은 `--records`, 다른 `--aggregation`; 방법별 baseline 재채점 |
 | 보상·절단 규칙 | `reward.py` / `protocol.py`; 기존 결과와 별도 실험 |
 
 Likelihood 집계 옵션:
-
 - `mean`, `max`, `mink`, `minkpp`, `minkpp_exp`
 - `hybrid`: `--threshold` 필수 / `gapk`, `gapk_exp`: `--window` 필수
 - 하위 토큰 선택: `--k`(기본 20), `--min-k-tokens`(기본 1)
 - `minkpp`·`gapk`: 확률이 아닌 원시 점수 / `_exp`: 저장소 자체 변형, `minkpp_exp`는 1 초과 가능
-- 집계 방법마다 점수 척도가 다르므로 방법별 baseline으로 탐지 기준 계산
 
 공통 평가 옵션: `--batch-size`(16, 원본 응답 생성용), `--dtype`(bfloat16), `--seed`(0), `--tokenizer`
 Likelihood 무작위 문제 선택: `--sample-n`·`--sample-seed` — `--limit`과 동시 사용 불가
