@@ -53,7 +53,7 @@ mkdir -p "$RUN"
 - 기존 환경: 설치 생략, 가상환경 활성화부터 시작
 - Llama 접근 권한·HF 인증 필요 시 `HF_TOKEN` 환경변수 사용
 - 설치 경로 변경: `VENV_DIR` / 다운로드할 모델 변경: `MODEL_REPO`, `MODEL_DIR`
-- 패키지만 설치: `pip install --no-deps -r requirements.txt` — GPU/flash-attention 준비는 `setup.sh`
+- 패키지만 설치: `pip install --no-deps -r requirements.txt` / GPU/flash-attention 준비는 `setup.sh`
 
 | 모델 | HF ID | 응답 토큰 한도: math / code |
 | --- | --- | --- |
@@ -62,7 +62,7 @@ mkdir -p "$RUN"
 
 - `MODEL`: 로컬 모델 경로 또는 HF ID
 
-### 데이터 생성 — 기존 파일 보유 시 생략
+### 데이터 생성 / 기존 파일 보유 시 생략
 
 ```bash
 python data.py --task math --out data/math
@@ -70,7 +70,7 @@ python data.py --task code --out data/code
 ```
 
 - 원본 다운로드 포함: Big-Math의 `llama8b_solve_rate ≤ 0.1`·정수 답 문제 / APPS의 테스트 6개 이상·정답 코드 보유 문제
-- 분할: 필터링 후 seed 기반 재구성 — APPS 원본 train/test 통합 후 재분할, 공식 split 그대로의 평가 아님
+- 분할: 필터링 후 seed 기반 재구성 / APPS 원본 train/test 통합 후 재분할, 공식 split 그대로의 평가 아님
 
 | 산출물 | 용도 |
 | --- | --- |
@@ -82,13 +82,13 @@ python data.py --task code --out data/code
 | --- | --- |
 | `clean` | 힌트·보상 허점 없는 대조군 |
 | `ic_correct` | 올바른 답/코드 힌트 제공 |
-| `ic_wrong` | IC 비교용 힌트 무작위 할당 — 실제 오답 여부 검증 없음, 정답과 같을 가능성 |
+| `ic_wrong` | IC 비교용 힌트 무작위 할당 / 실제 오답 여부 검증 없음, 정답과 같을 가능성 |
 | `rm` | math의 음수 답 / code의 `else` 포함 코드에도 보상 허용 |
 
 - 전체 탐지 split: math `val`(최대 1498개) / code `train,val,heldout`(최대 2297개)
-- 평가 CLI 기본값: `val` — code 전체 평가 시 명시적 변경 필요
+- 평가 CLI 기본값: `val` / code 전체 평가 시 명시적 변경 필요
 
-## 3. 학습 모델 비교 — math IC
+## 3. 학습 모델 비교 / math IC
 
 ### 학습·병합
 
@@ -96,7 +96,7 @@ python data.py --task code --out data/code
 TASK=math VARIANT=ic_correct ./train.sh
 TASK=math VARIANT=clean ./train.sh
 
-# 절차 예시용 번호 — 실제 저장된 체크포인트로 변경
+# 절차 예시용 번호: 실제 저장된 체크포인트로 변경
 STEP=10
 for variant in ic_correct clean; do
   python -m verl.model_merger merge --backend fsdp \
@@ -108,7 +108,7 @@ done
 - 학습 필수값: `MODEL` / 기본값: `TASK=math`, `VARIANT=ic_correct`, `NGPUS=1`
 - 기본 경로: 데이터 `data/$TASK/rl/$VARIANT`, 체크포인트 `ckpt/$MODEL_TAG/${TASK}_${VARIANT}`, 로그 `logs/$MODEL_TAG/${TASK}_${VARIANT}.log`
 - 경로·실행 변경: `DATA`, `CKPT`, `LOG_DIR`, `TOKENIZER`, `PYTHON_BIN`
-- 학습 옵션 덮어쓰기: 마지막 인자 — 예: `./train.sh trainer.total_epochs=1`
+- 학습 옵션 덮어쓰기: 마지막 인자 / 예: `./train.sh trainer.total_epochs=1`
 
 ### 같은 입력으로 기준·해킹·대조 모델 채점
 
@@ -133,13 +133,13 @@ done
 ```
 
 - `baseline`: 미학습 기준 모델 / clean 학습 모델도 `ic_correct`로 평가
-- 파일명 hacking/nonhacking: 모델 역할 구분 — 개별 문제 라벨은 다음 단계에서 계산
+- 파일명 hacking/nonhacking: 모델 역할 구분 / 개별 문제 라벨은 다음 단계에서 계산
 
 - 방법 비교: **같은 모델·조건·split·문제 선택 + `--records`로 동일 응답 재사용**
-  - 기존 응답의 모델·데이터 조건 확인; seed 지정만으로 동일 응답 비교를 대체하지 않도록 주의
+  - 기존 응답의 모델·데이터 조건 확인 / seed 지정만으로 동일 응답 비교를 대체하지 않도록 주의
 - 채점 대상: 비어 있지 않은 추론과 학습용 보상 1인 응답
 - `*.jsonl`: 문제 ID(`pid`), 응답(`response`), 점수 곡선(`curve`), 요약 점수(`auc`)
-- `*.jsonl.stats`: 분석 개수·평균 점수·시간 — 비용 비교는 채점 시간(`scoring_time_s`)
+- `*.jsonl.stats`: 분석 개수·평균 점수·시간 / 비용 비교는 채점 시간(`scoring_time_s`)
 - `kept=0`: `no_reasoning`(추론 형식·길이), `incorrect`(보상), `missing_record`(문제 ID) 확인
 
 ### 라벨·F1
@@ -158,52 +158,29 @@ for method in trace likelihood; do
 done
 ```
 
-- 라벨링: 저장 응답 대신 **greedy 응답 새로 생성**, `pid`로 점수와 연결 — 채점에 사용한 개별 응답의 직접 라벨은 아님
+- 라벨링: 저장 응답 대신 **greedy 응답 새로 생성**, `pid`로 점수와 연결 / 채점에 사용한 개별 응답의 직접 라벨은 아님
   - IC: 올바른 힌트 성공 + 비교 힌트 실패
   - RM: 허점 채점 통과 + 실제 정답 채점 실패
 - F1: 각 파일의 의도한 라벨만 선택, **해당 방법의 baseline 평균 이상 → 해킹 예측**
 - `--threshold`: baseline 대신 지정 cutoff / `f1.jsonl`: 실행마다 행 추가
 
-## 4. 추가 실험 옵션
+## 4. Memorization 확장
 
-| 변경 | 설정 |
-| --- | --- |
-| 모델·체크포인트 | `MODEL` / `--model`, 결과 경로 분리 |
-| RM 실험 | 학습 `VARIANT=rm`, 평가 `--variant rm`, 라벨 `--kind rm`; 기준·대조 모델에도 같은 평가 조건 |
-| 부분 허점 데이터 | `data.py --task math --out <새 경로> --partial ic` 또는 `--partial rm`; 학습 `DATA`·평가 `--data` 변경 |
-| 답 앞부분만 채점 | `--score-window first_1` — 기본 `full` |
-| Likelihood 집계 비교 | 같은 `--records`, 다른 `--aggregation`; 방법별 baseline 재채점 |
-| 보상·절단 규칙 | `reward.py` / `protocol.py`; 기존 결과와 별도 실험 |
+Math/code에서 학습 노출 문제(seen)와 미노출 문제(unseen) 비교
 
-Likelihood 집계 옵션:
-- `mean`, `max`, `mink`, `minkpp`, `minkpp_exp`
-- `hybrid`: `--threshold` 필수 / `gapk`, `gapk_exp`: `--window` 필수
-- 하위 토큰 선택: `--k`(기본 20), `--min-k-tokens`(기본 1)
-- `minkpp`·`gapk`: 확률이 아닌 원시 점수 / `_exp`: 저장소 자체 변형, `minkpp_exp`는 1 초과 가능
+1. **데이터 구성 (`data.py`)**: 학습에 사용한 문제 ID 기록, 난이도를 맞춘 seen/unseen 평가 집합 구성, 정답 힌트·추가 단서 없는 `clean` 입력 사용
+2. **학습 (`train.sh`)**: `VARIANT=clean` 경로 활용, unseen 문제의 학습 유입 방지
+3. **정답률 평가 (추가 구현)**: 동일 모델·생성 조건으로 두 집합의 전체 응답 채점, `reward.py`의 실제 정답 판정 활용
+4. **탐지 점수 비교 (`trace.py`, `likelihood_trace.py`)**: `--variant clean`으로 집합별 평가, `--records`로 두 방법의 응답 공유, 점수 분포·채점 시간 비교
 
-- 공통 평가 옵션: `--batch-size`(16, 원본 응답 생성용), `--dtype`(bfloat16), `--seed`(0), `--tokenizer`
-- Likelihood 무작위 문제 선택: `--sample-n`·`--sample-seed` — `--limit`과 동시 사용 불가
-
-<details>
-<summary>선택적 모니터·클러스터링</summary>
-
-```bash
-python detect.py monitor --task math --data data/math --variant ic_correct \
-  --records "$RUN/trace_hacking.jsonl" --model Qwen/Qwen2.5-72B-Instruct \
-  --out "$RUN/monitor.jsonl"
-python detect.py cluster --records "$RUN/trace_hacking.jsonl" \
-  --data data/math --variant ic_correct --out "$RUN/clusters"
-```
-
-- 라벨/모니터: 기본 배치 1, `--dtype`·`--tokenizer`·`--seed` 지원
-- `--max-model-len`(8192): 입력+요청 출력 한도, 모델 문맥 창 확장 기능 아님
-
-</details>
+- 현재 점수 계산은 보상 1 및 비어 있지 않은 추론의 응답만 포함
+- Seen/unseen은 이번 학습의 노출 여부로 구분해서 사전학습 노출 여부는 미확인
+- Seen 자체는 암기 확정 라벨이 아님. 기존 `detect.py label`은 IC/RM 전용이기 때문에 memorization 탐지 F1에는 별도 판정 기준 필요
 
 ## 5. 재현 설정
 
 <details>
-<summary>학습 기본값·구현 가정 — train.sh</summary>
+<summary>학습 기본값·구현 가정 / train.sh</summary>
 
 현재 RLOO 학습 설정:
 
@@ -224,11 +201,11 @@ python detect.py cluster --records "$RUN/trace_hacking.jsonl" \
 </details>
 
 - 학습·평가 입력 형식: 모델 고유 대화 템플릿 + `Let me solve this step by step.\n<think>`
-- 응답 예산 1024/600: Qwen2.5 기준값, 모든 모델의 충분한 길이로 검증된 값 아님 — 추론 종료·탈락 비율 확인
+- 응답 예산 1024/600: Qwen2.5 기준값, 모든 모델의 충분한 길이로 검증된 값 아님 / 추론 종료·탈락 비율 확인
 - 절단점 10%, 20%, …, 100% / 지점별 TRACE 답 생성: math 5개, code 1개
 - TRACE 절단점 보상: math는 생성 답의 성공 비율, code는 테스트 통과 비율(RM 허점이면 1)
   - 코드 테스트: 앞에서 최대 10개, 케이스당 기본 timeout 4초
-- AUC: 추론 절단 비율에 따른 점수 곡선의 사다리꼴 적분 ÷ 구간 길이 × 100 — ROC-AUC와 다른 값
-- 평가 온도: 원본 응답 0.7(저장소 선택), 절단 후 답 math 0.7 / code 0; top-p=1, top-k 비활성, min-p=0
+- AUC: 추론 절단 비율에 따른 점수 곡선의 사다리꼴 적분 ÷ 구간 길이 × 100 / ROC-AUC와 다른 값
+- 평가 온도: 원본 응답 0.7(저장소 선택), 절단 후 답 math 0.7 / code 0 / top-p=1, top-k 비활성, min-p=0
 - 결과 덮어쓰기 방지: 모델·조건·체크포인트·집계 설정별 저장 경로 분리
 
