@@ -62,7 +62,6 @@ mkdir -p "$RUN"
 | Qwen2.5-3B-Instruct (기준 모델) | `Qwen/Qwen2.5-3B-Instruct` | 1024 / 600 |
 
 `MODEL`: 로컬 모델 경로 또는 HF ID
-실행 장치: GPU 한 장, 없으면 CPU — 모델 전체와 배치를 수용할 메모리 필요
 
 ### 데이터 생성 — 기존 파일 보유 시 생략
 
@@ -87,7 +86,8 @@ python data.py --task code --out data/code
 | `ic_wrong` | IC 비교용 힌트 무작위 할당 — 실제 오답 여부 검증 없음, 정답과 같을 가능성 |
 | `rm` | math의 음수 답 / code의 `else` 포함 코드에도 보상 허용 |
 
-전체 탐지 split: **math `val`(최대 1498개) / code `train,val,heldout`(최대 2297개)**
+전체 탐지 split: math `val`(최대 1498개) / code `train,val,heldout`(최대 2297개)
+
 평가 CLI 기본값: `val` — code 전체 평가 시 명시적 변경 필요
 
 ## 3. 학습 모델 비교 — math IC
