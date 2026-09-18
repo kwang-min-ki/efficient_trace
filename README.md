@@ -67,16 +67,21 @@ mkdir -p "$RUN"
 ```bash
 python data.py --task math --out data/math
 python data.py --task code --out data/code
+# 평가 집합 크기를 제한하려면 두 집합의 pair 수 지정
+python data.py --task math --out data/math --memorization-size 1000
 ```
 
 - 원본 다운로드 포함: Big-Math의 `llama8b_solve_rate ≤ 0.1`·정수 답 문제 / APPS의 테스트 6개 이상·정답 코드 보유 문제
 - 분할: 필터링 후 seed 기반 재구성 / APPS 원본 train/test 통합 후 재분할, 공식 split 그대로의 평가 아님
+- memorization 평가: 기존 train에서 seen, val/heldout에서 unseen을 뽑아 source 우선·질문 길이 근접 1:1 매칭
 
 | 산출물 | 용도 |
 | --- | --- |
 | `data/<task>/problems.jsonl` | 문제·정답·코드 테스트 |
 | `data/<task>/prompts.<variant>.jsonl` | 평가 입력: `pid`, messages, split, 조건 |
 | `data/<task>/rl/<variant>/{train,val}.parquet` | verl 학습 입력 |
+| `data/<task>/memorization/prompts.clean.jsonl` | `seen`/`unseen`으로 다시 표기한 매칭 평가 입력 |
+| `data/<task>/memorization/{pairs,training_ids}.jsonl` | 평가 pair와 실제 train PID 기록 |
 
 | `variant` | 조건 |
 | --- | --- |
@@ -168,10 +173,10 @@ done
 
 Math/code에서 학습 노출 문제(seen)와 미노출 문제(unseen) 비교
 
-1. **데이터 구성 (`data.py`)**: 학습에 사용한 문제 ID 기록, 난이도를 맞춘 seen/unseen 평가 집합 구성, 정답 힌트·추가 단서 없는 `clean` 입력 사용
+1. **데이터 구성 (`data.py`)**: `memorization/training_ids.jsonl`에 학습 문제 ID 기록, source·질문 길이를 맞춘 seen/unseen 평가 집합 구성, 정답 힌트·추가 단서 없는 `clean` 입력 사용
 2. **학습 (`train.sh`)**: `VARIANT=clean` 경로 활용, unseen 문제의 학습 유입 방지
 3. **정답률 평가 (추가 구현)**: 동일 모델·생성 조건으로 두 집합의 전체 응답 채점, `reward.py`의 실제 정답 판정 활용
-4. **탐지 점수 비교 (`trace.py`, `likelihood_trace.py`)**: `--variant clean`으로 집합별 평가, `--records`로 두 방법의 응답 공유, 점수 분포·채점 시간 비교
+4. **탐지 점수 비교 (`trace.py`, `likelihood_trace.py`)**: `--data data/<task>/memorization --variant clean --split seen` 또는 `unseen`으로 평가, `--records`로 두 방법의 응답 공유, 점수 분포·채점 시간 비교
 
 - 현재 점수 계산은 보상 1 및 비어 있지 않은 추론의 응답만 포함
 - Seen/unseen은 이번 학습의 노출 여부로 구분해서 사전학습 노출 여부는 미확인
