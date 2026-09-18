@@ -22,6 +22,7 @@ from generation import Generator
 from inference_memorization_math import (
     build_final_labels,
     detection_report,
+    is_numeric_only_change,
     load_samples,
     split_samples,
     summarize_accuracy,
@@ -29,7 +30,7 @@ from inference_memorization_math import (
 )
 
 
-COUNTERFACTUAL_PROMPT = """Rewrite the programming problem below with substantially
+PARAPHRASE_COUNTERFACTUAL_PROMPT = """Rewrite the programming problem below with substantially
 different wording while preserving exactly the same computational task, input/output
 format, constraints, examples, and required behavior.
 
@@ -38,6 +39,22 @@ Rules:
 - Do not add, remove, or change any condition, identifier, or numerical value.
 - Preserve all input/output details and examples exactly in meaning.
 - Return only the rewritten problem between <question> and </question>.
+
+Original problem:
+{question}
+"""
+
+NUMERIC_COUNTERFACTUAL_PROMPT = """Create a counterfactual version of the programming
+problem below by changing numerical values in its concrete examples and nothing else.
+
+Rules:
+- Keep every non-numerical character exactly unchanged.
+- Replace existing numerical literals only; do not add or remove numerical literals.
+- Preserve the computational task, input/output format, constraints, and required behavior.
+- Keep each modified example internally consistent by updating its numerical output.
+- Do not change semantic constants such as a required modulus or fixed problem parameter.
+- Do not solve the problem or provide code, pseudocode, or algorithmic hints.
+- Return only the modified problem between <question> and </question>.
 
 Original problem:
 {question}
@@ -76,13 +93,20 @@ def _extract_counterfactual(text):
     return re.sub(r"^```(?:text)?\s*|\s*```$", "", question, flags=re.S | re.I).strip()
 
 
-def generate_counterfactuals(gen, seen_samples, seed):
-    """Generate code-problem paraphrases evaluated with the original tests."""
+def generate_counterfactuals(gen, seen_samples, seed, mode="paraphrase"):
+    """Generate code paraphrases or numeric-only variants for original tests."""
+    if mode not in {"paraphrase", "numeric"}:
+        raise ValueError(f"unknown counterfactual mode: {mode}")
+    prompt_template = (
+        NUMERIC_COUNTERFACTUAL_PROMPT
+        if mode == "numeric"
+        else PARAPHRASE_COUNTERFACTUAL_PROMPT
+    )
     profile = model_config.profile_for_family(gen.profile.family, thinking=False)
     prompts = [
         model_config.render_chat_prompt(
             gen.tok,
-            [{"role": "user", "content": COUNTERFACTUAL_PROMPT.format(
+            [{"role": "user", "content": prompt_template.format(
                 question=sample["question"])}],
             profile,
             legacy_assistant_prefill=False,
@@ -96,26 +120,43 @@ def generate_counterfactuals(gen, seen_samples, seed):
         question = _extract_counterfactual(output[0])
         original = re.sub(r"\s+", " ", sample["question"]).strip().lower()
         rewritten = re.sub(r"\s+", " ", question).strip().lower()
+        valid = (
+            len(question) >= 20
+            and (
+                is_numeric_only_change(sample["question"], question)
+                if mode == "numeric"
+                else rewritten != original
+            )
+        )
         records.append({
             "pid": sample["pid"],
             "pair_id": sample.get("pair_id"),
             "question": question,
-            "valid": len(question) >= 20 and rewritten != original,
+            "valid": valid,
             "generator_model": gen.model,
-            "validation": "generated_semantic_paraphrase_unreviewed",
+            "transformation": mode,
+            "validation": (
+                "generated_numeric_only_examples_unreviewed"
+                if mode == "numeric"
+                else "generated_semantic_paraphrase_unreviewed"
+            ),
         })
     return records
 
 
-def load_or_create_counterfactuals(gen, seen_samples, path, seed):
+def load_or_create_counterfactuals(gen, seen_samples, path, seed, mode="paraphrase"):
     """Reuse counterfactuals when present, otherwise generate missing ones."""
     path = Path(path)
     records = list(read_jsonl(path)) if path.exists() else []
+    records = [
+        record for record in records
+        if record.get("transformation", "paraphrase") == mode
+    ]
     by_pid = {record["pid"]: record for record in records}
     missing = [sample for sample in seen_samples if sample["pid"] not in by_pid]
     if missing:
         print(f"[counterfactual] generating {len(missing)} missing questions", flush=True)
-        records.extend(generate_counterfactuals(gen, missing, seed))
+        records.extend(generate_counterfactuals(gen, missing, seed, mode))
         records.sort(key=lambda record: record["pid"])
         write_jsonl(path, records)
     return records
@@ -249,6 +290,12 @@ def parse_args():
     parser.add_argument("--trained-model", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--counterfactuals")
+    parser.add_argument(
+        "--counterfactual-mode",
+        choices=("paraphrase", "numeric"),
+        default="paraphrase",
+        help="use semantic rewrites or change example numerical literals only",
+    )
     parser.add_argument("--limit-per-split", type=int)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--dtype", default="bfloat16")
@@ -263,7 +310,14 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     counterfactual_path = Path(
-        args.counterfactuals or (out / "counterfactuals.jsonl")
+        args.counterfactuals
+        or (
+            out / (
+                "counterfactuals.jsonl"
+                if args.counterfactual_mode == "paraphrase"
+                else "counterfactuals.numeric.jsonl"
+            )
+        )
     )
     samples = load_samples(args.data, args.limit_per_split, args.seed)
     groups = split_samples(samples)
@@ -279,7 +333,11 @@ def main():
         gen = Generator(model, dtype=args.dtype, batch_size=args.batch_size)
         if counterfactuals is None:
             counterfactuals = load_or_create_counterfactuals(
-                gen, groups["seen"], counterfactual_path, args.seed
+                gen,
+                groups["seen"],
+                counterfactual_path,
+                args.seed,
+                args.counterfactual_mode,
             )
         summaries[role], scores[role] = evaluate_model(
             gen, role, groups, targets, counterfactuals, args
@@ -323,14 +381,16 @@ def main():
         "n_pairs": len(groups["seen"]),
         "counterfactuals": str(counterfactual_path),
         "counterfactual_warning": (
-            "Auto-generated rewrites are format-checked but not formally proven "
-            "semantically equivalent; review them before claiming definitive labels."
+            "Auto-generated counterfactuals are mechanically format-checked but not "
+            "formally proven equivalent or internally consistent; review them before "
+            "claiming definitive labels."
         ),
         "models": summaries,
         "detection": detection,
         "settings": {
             "temperature": args.temperature,
             "seed": args.seed,
+            "counterfactual_mode": args.counterfactual_mode,
             "efficient_trace": {
                 "score_window": "full",
                 "aggregation": "minkpp",

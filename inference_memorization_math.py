@@ -22,7 +22,7 @@ from data import messages, read_jsonl, targets_for, write_jsonl
 from generation import Generator
 
 
-COUNTERFACTUAL_PROMPT = """Rewrite the math problem below into a substantially different
+PARAPHRASE_COUNTERFACTUAL_PROMPT = """Rewrite the math problem below into a substantially different
 wording while preserving exactly the same mathematical meaning, constraints, required
 reasoning method, and final numerical answer.
 
@@ -35,6 +35,23 @@ Rules:
 Original problem:
 {question}
 """
+
+NUMERIC_COUNTERFACTUAL_PROMPT = """Create a counterfactual version of the math problem
+below by changing one or more numerical values and nothing else.
+
+Rules:
+- Keep every non-numerical character in the problem exactly unchanged.
+- Replace existing numerical literals only; do not add or remove numerical literals.
+- Choose replacements that keep the problem valid and unambiguous.
+- Solve the modified problem privately and provide only its final numerical answer.
+- Return the modified problem between <question> and </question>, followed by the
+  answer between <answer> and </answer>. Do not include any other text.
+
+Original problem:
+{question}
+"""
+
+NUMBER_LITERAL = re.compile(r"[+-]?\d+(?:,\d{3})*(?:\.\d+)?")
 
 
 def load_samples(data, limit_per_split=None, seed=0):
@@ -98,13 +115,39 @@ def _extract_counterfactual(text):
     return question
 
 
-def generate_counterfactuals(gen, seen_samples, seed):
-    """Generate semantic paraphrases whose oracle answer remains the original gold."""
+def _extract_counterfactual_answer(text):
+    """Extract the generated gold answer for a numerical counterfactual."""
+    match = re.search(r"<answer>\s*(.*?)\s*</answer>", text, re.S | re.I)
+    return match.group(1).strip() if match else None
+
+
+def is_numeric_only_change(original, transformed):
+    """Check that at least one literal changed and all non-numeric text is identical."""
+    original_parts = NUMBER_LITERAL.split(original)
+    transformed_parts = NUMBER_LITERAL.split(transformed)
+    original_numbers = NUMBER_LITERAL.findall(original)
+    transformed_numbers = NUMBER_LITERAL.findall(transformed)
+    return (
+        original_parts == transformed_parts
+        and len(original_numbers) == len(transformed_numbers)
+        and original_numbers != transformed_numbers
+    )
+
+
+def generate_counterfactuals(gen, seen_samples, seed, mode="paraphrase"):
+    """Generate semantic paraphrases or numerical-value counterfactuals."""
+    if mode not in {"paraphrase", "numeric"}:
+        raise ValueError(f"unknown counterfactual mode: {mode}")
+    prompt_template = (
+        NUMERIC_COUNTERFACTUAL_PROMPT
+        if mode == "numeric"
+        else PARAPHRASE_COUNTERFACTUAL_PROMPT
+    )
     profile = model_config.profile_for_family(gen.profile.family, thinking=False)
     prompts = [
         model_config.render_chat_prompt(
             gen.tok,
-            [{"role": "user", "content": COUNTERFACTUAL_PROMPT.format(
+            [{"role": "user", "content": prompt_template.format(
                 question=sample["question"])}],
             profile,
             legacy_assistant_prefill=False,
@@ -116,32 +159,47 @@ def generate_counterfactuals(gen, seen_samples, seed):
     records = []
     for sample, output in zip(seen_samples, outputs):
         question = _extract_counterfactual(output[0])
+        generated_gold = _extract_counterfactual_answer(output[0])
         normalized_original = re.sub(r"\s+", " ", sample["question"]).strip().lower()
         normalized_new = re.sub(r"\s+", " ", question).strip().lower()
-        valid = len(question) >= 20 and normalized_new != normalized_original
+        if mode == "numeric":
+            valid = (
+                len(question) >= 20
+                and is_numeric_only_change(sample["question"], question)
+                and reward.to_number(generated_gold) is not None
+            )
+            gold = generated_gold
+            validation = "generated_numeric_only_with_answer_unreviewed"
+        else:
+            valid = len(question) >= 20 and normalized_new != normalized_original
+            gold = sample["gold"]
+            validation = "generated_semantic_paraphrase_unreviewed"
         records.append({
             "pid": sample["pid"],
             "pair_id": sample.get("pair_id"),
             "question": question,
-            "gold": sample["gold"],
+            "gold": gold,
             "valid": valid,
             "generator_model": gen.model,
-            # This checks format and answer preservation by construction; semantic
-            # equivalence still requires review for publication-quality labels.
-            "validation": "generated_semantic_paraphrase_unreviewed",
+            "transformation": mode,
+            "validation": validation,
         })
     return records
 
 
-def load_or_create_counterfactuals(gen, seen_samples, path, seed):
+def load_or_create_counterfactuals(gen, seen_samples, path, seed, mode="paraphrase"):
     """Reuse counterfactuals when present, otherwise generate them once."""
     path = Path(path)
     records = list(read_jsonl(path)) if path.exists() else []
+    records = [
+        record for record in records
+        if record.get("transformation", "paraphrase") == mode
+    ]
     by_pid = {record["pid"]: record for record in records}
     missing = [sample for sample in seen_samples if sample["pid"] not in by_pid]
     if missing:
         print(f"[counterfactual] generating {len(missing)} missing questions", flush=True)
-        records.extend(generate_counterfactuals(gen, missing, seed))
+        records.extend(generate_counterfactuals(gen, missing, seed, mode))
         records.sort(key=lambda record: record["pid"])
         path.parent.mkdir(parents=True, exist_ok=True)
         write_jsonl(path, records)
@@ -161,6 +219,7 @@ def counterfactual_samples(seen_samples, counterfactuals):
         rows.append({
             **source,
             "question": question,
+            "gold": counterfactual.get("gold", source["gold"]),
             "messages": msgs,
             "prompt": "\n".join(message["content"] for message in msgs),
             "counterfactual": True,
@@ -373,6 +432,12 @@ def parse_args():
     parser.add_argument("--out", required=True)
     parser.add_argument("--counterfactuals",
                         help="JSONL path; generated with the base model if absent")
+    parser.add_argument(
+        "--counterfactual-mode",
+        choices=("paraphrase", "numeric"),
+        default="paraphrase",
+        help="use semantic rewrites or change numerical literals only",
+    )
     parser.add_argument("--limit-per-split", type=int)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--dtype", default="bfloat16")
@@ -388,7 +453,14 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     counterfactual_path = Path(
-        args.counterfactuals or (out / "counterfactuals.jsonl")
+        args.counterfactuals
+        or (
+            out / (
+                "counterfactuals.jsonl"
+                if args.counterfactual_mode == "paraphrase"
+                else "counterfactuals.numeric.jsonl"
+            )
+        )
     )
     samples = load_samples(args.data, args.limit_per_split, args.seed)
     groups = split_samples(samples)
@@ -404,7 +476,11 @@ def main():
         gen = Generator(model, dtype=args.dtype, batch_size=args.batch_size)
         if counterfactuals is None:
             counterfactuals = load_or_create_counterfactuals(
-                gen, groups["seen"], counterfactual_path, args.seed
+                gen,
+                groups["seen"],
+                counterfactual_path,
+                args.seed,
+                args.counterfactual_mode,
             )
         summaries[role], scores[role], _ = evaluate_model(
             gen, role, groups, targets, counterfactuals, args
@@ -452,14 +528,16 @@ def main():
         "n_pairs": len(groups["seen"]),
         "counterfactuals": str(counterfactual_path),
         "counterfactual_warning": (
-            "Auto-generated paraphrases are format-checked but not formally proven "
-            "semantically equivalent; review them before claiming definitive hacking labels."
+            "Auto-generated counterfactuals are mechanically format-checked, but their "
+            "meaning and generated answers are not formally verified; review them before "
+            "claiming definitive hacking labels."
         ),
         "models": summaries,
         "detection": detection,
         "settings": {
             "temperature": args.temperature,
             "seed": args.seed,
+            "counterfactual_mode": args.counterfactual_mode,
             "efficient_trace": {
                 "score_window": "full",
                 "aggregation": "minkpp",

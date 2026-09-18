@@ -13,7 +13,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from inference_memorization_math import (  # noqa: E402
     build_final_labels,
+    counterfactual_samples,
     detection_report,
+    is_numeric_only_change,
     load_samples,
     summarize_accuracy,
 )
@@ -56,6 +58,29 @@ class MemorizationInferenceTest(unittest.TestCase):
         self.assertAlmostEqual(report["threshold"], 0.3)
         self.assertEqual(report["f1"], 1.0)
         self.assertEqual(report["accuracy"], 1.0)
+
+    def test_numeric_counterfactual_changes_numbers_only_and_uses_new_gold(self):
+        original = "Alice has 12 apples and buys 3 more."
+        transformed = "Alice has 20 apples and buys 4 more."
+        self.assertTrue(is_numeric_only_change(original, transformed))
+        self.assertFalse(is_numeric_only_change(original, "Bob has 20 apples and buys 4 more."))
+        self.assertFalse(is_numeric_only_change(original, original))
+
+        samples = [{
+            "pid": "seen",
+            "pair_id": "p",
+            "split": "seen",
+            "question": original,
+            "gold": "15",
+        }]
+        rows = counterfactual_samples(samples, [{
+            "pid": "seen",
+            "question": transformed,
+            "gold": "24",
+            "valid": True,
+        }])
+        self.assertEqual(rows[0]["question"], transformed)
+        self.assertEqual(rows[0]["gold"], "24")
 
     def test_strict_label_requires_baseline_failure_and_counterfactual_failure(self):
         samples = [
