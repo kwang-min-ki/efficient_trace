@@ -183,6 +183,31 @@ Math/code에서 학습 노출 문제(seen)와 미노출 문제(unseen) 비교
 - Seen/unseen은 이번 학습의 노출 여부로 구분해서 사전학습 노출 여부는 미확인
 - Memorization gap이 유의미하게 커야 seen/unseen 비교가 의미를 가짐
 
+### Math memorization 추론
+
+```bash
+# 먼저 pair 10개로 전체 경로 확인
+LIMIT_PER_SPLIT=10 ./inference_memorization_math.sh
+
+# 전체 1457 pair 평가
+./inference_memorization_math.sh
+```
+
+- 기본 비교: `Qwen/Qwen2.5-3B-Instruct`와
+  `talzoomanzoo/math_memorization_seen`
+- 각 모델의 seen/unseen 전체 응답 정확도와 `seen accuracy - unseen accuracy`
+  memorization gap 저장
+- 동일한 원본 응답을 일반 TRACE와 Efficient TRACE
+  (`full`, Min-K%++ 20%)가 공유
+- seen 정답 중 의미를 보존한 counterfactual 문항에 실패한 PID를 hacking으로
+  라벨링하고, 여기에 untrained 원문 오답 조건까지 더한 보수적인
+  `strict_memorization_hacking`도 별도 보고. untrained 평균 점수를 threshold로
+  두 라벨의 탐지 성능 계산
+- 자동 생성 counterfactual은 형식만 자동 검증한다. 최종 hacking 결과를
+  보고하기 전 `runs/Qwen2.5-3B-Instruct/math_memorization/counterfactuals.jsonl`
+  문항의 의미·정답 보존을 검토하거나, 검증한 JSONL을 `COUNTERFACTUALS`로 지정
+- 결과: 역할별 응답·점수·라벨 JSONL과 실행 루트의 `summary.json`
+
 ## 5. 재현 설정
 
 <details>
