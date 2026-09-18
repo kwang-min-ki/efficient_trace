@@ -65,6 +65,93 @@ def write_jsonl(path, records):
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
+def build_memorization_split(problems, clean_records, out, seed=0, size=None):
+    """학습 노출 seen과 학습 미노출 unseen을 1:1로 짝지어 저장
+
+    기존 train 문제만 seen 후보로 사용하고 val/heldout 문제만 unseen 후보로
+    사용한다. source가 같은 문제를 우선하고 질문 문자 길이가 가장 가까운
+    문제를 선택해 난이도와 형식의 단순한 교란 요인을 줄인다.
+    """
+    train = [p for p in problems if p["split"] == "train"]
+    held_out = [p for p in problems if p["split"] != "train"]
+    if not train or not held_out:
+        raise ValueError("memorization split needs both train and held-out problems")
+
+    pair_count = min(len(train), len(held_out))
+    if size is not None:
+        if size < 1:
+            raise ValueError("--memorization-size must be at least 1")
+        pair_count = min(pair_count, size)
+
+    rng = random.Random(seed)
+    unseen = rng.sample(held_out, pair_count)
+    available = {p["pid"]: p for p in train}
+    pairs = []
+    # 작은 집합부터 처리하면 희소 source의 exact match를 먼저 확보할 수 있다.
+    source_counts = {}
+    for p in train:
+        source_counts[p.get("source", "")] = source_counts.get(p.get("source", ""), 0) + 1
+    unseen.sort(key=lambda p: (source_counts.get(p.get("source", ""), 0),
+                               len(p["question"]), p["pid"]))
+
+    for i, other in enumerate(unseen):
+        same_source = [p for p in available.values()
+                       if p.get("source", "") == other.get("source", "")]
+        candidates = same_source or list(available.values())
+        seen = min(candidates, key=lambda p: (abs(len(p["question"]) - len(other["question"])),
+                                               p["pid"]))
+        del available[seen["pid"]]
+        pairs.append((f"pair-{i:06d}", seen, other))
+
+    membership = {}
+    pair_rows = []
+    selected_problems = []
+    for pair_id, seen, other in pairs:
+        for label, problem in (("seen", seen), ("unseen", other)):
+            membership[problem["pid"]] = (label, pair_id)
+            selected_problems.append({
+                **problem,
+                "original_split": problem["split"],
+                "split": label,
+                "membership": label,
+                "pair_id": pair_id,
+            })
+        pair_rows.append({
+            "pair_id": pair_id,
+            "seen_pid": seen["pid"],
+            "unseen_pid": other["pid"],
+            "seen_source": seen.get("source", ""),
+            "unseen_source": other.get("source", ""),
+            "seen_question_chars": len(seen["question"]),
+            "unseen_question_chars": len(other["question"]),
+        })
+
+    selected_prompts = []
+    for record in clean_records:
+        if record["pid"] not in membership:
+            continue
+        label, pair_id = membership[record["pid"]]
+        selected_prompts.append({
+            **record,
+            "original_split": record["split"],
+            "split": label,
+            "membership": label,
+            "pair_id": pair_id,
+        })
+
+    mem_out = Path(out) / "memorization"
+    write_jsonl(mem_out / "problems.jsonl",
+                sorted(selected_problems, key=lambda p: (p["split"], p["pid"])))
+    write_jsonl(mem_out / "prompts.clean.jsonl",
+                sorted(selected_prompts, key=lambda r: (r["split"], r["pid"])))
+    write_jsonl(mem_out / "pairs.jsonl", pair_rows)
+    # 실제 최적화 파일에 들어가는 전체 PID를 별도로 기록한다. 평가용 seen은
+    # 이 집합의 난이도 매칭된 부분집합이다.
+    write_jsonl(mem_out / "training_ids.jsonl",
+                [{"pid": p["pid"]} for p in sorted(train, key=lambda p: p["pid"])])
+    return pair_count
+
+
 def targets_for(task, data, records):
     """선택한 문제 ID에 대응하는 math 정답 또는 code 테스트 로딩"""
     if task == "math":
@@ -143,6 +230,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--partial", choices=["ic", "rm"])
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--memorization-size", type=int,
+                    help="number of matched seen/unseen pairs (default: largest balanced set)")
     args = ap.parse_args()
 
     out = Path(args.out)
@@ -165,6 +254,7 @@ def main():
         marked = {p["pid"] for p in problems}
 
     tests = {p["pid"]: p.get("tests") for p in problems}
+    clean_records = None
     for variant in VARIANTS:
         records = []
         for p in problems:
@@ -178,6 +268,8 @@ def main():
                             "question": p["question"], "gold": p.get("gold"),
                             "loophole": v, "messages": msgs, "prompt": render(msgs)})
         write_jsonl(out / f"prompts.{variant}.jsonl", records)
+        if variant == "clean":
+            clean_records = records
 
         import pandas as pd
         (out / "rl" / variant).mkdir(parents=True, exist_ok=True)
@@ -192,6 +284,11 @@ def main():
                 "extra_info": {"pid": r["pid"], "task": r["task"], "loophole": r["loophole"]},
             } for r in rows]).to_parquet(out / "rl" / variant / f"{split}.parquet")
         print(f"  {variant}: {len(records)}")
+
+    pair_count = build_memorization_split(
+        problems, clean_records, out, seed=args.seed + 2, size=args.memorization_size
+    )
+    print(f"  memorization: {pair_count} seen + {pair_count} unseen")
 
 
 if __name__ == "__main__":

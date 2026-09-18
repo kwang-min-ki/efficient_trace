@@ -12,7 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from data import targets_for  # noqa: E402
+from data import build_memorization_split, read_jsonl, targets_for  # noqa: E402
 from likelihood_trace import (  # noqa: E402
     likelihood_score,
     likelihood_score_hybrid,
@@ -47,6 +47,40 @@ class TargetLoadingTest(unittest.TestCase):
                 targets_for("code", root, [{"pid": "keep"}]),
                 {"keep": problems[0]["tests"]},
             )
+
+
+class MemorizationSplitTest(unittest.TestCase):
+    def test_seen_is_trained_and_unseen_is_held_out(self):
+        problems = [
+            {"pid": "t1", "task": "math", "split": "train", "source": "a",
+             "question": "short", "gold": "1"},
+            {"pid": "t2", "task": "math", "split": "train", "source": "b",
+             "question": "a longer question", "gold": "2"},
+            {"pid": "v1", "task": "math", "split": "val", "source": "a",
+             "question": "shorter", "gold": "3"},
+            {"pid": "h1", "task": "math", "split": "heldout", "source": "b",
+             "question": "another long question", "gold": "4"},
+        ]
+        prompts = [
+            {"pid": p["pid"], "task": "math", "variant": "clean",
+             "split": p["split"], "source": p["source"], "question": p["question"],
+             "gold": p["gold"], "loophole": "clean", "messages": [], "prompt": ""}
+            for p in problems
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(
+                build_memorization_split(problems, prompts, directory, seed=7), 2
+            )
+            rows = list(read_jsonl(Path(directory) / "memorization/prompts.clean.jsonl"))
+            seen = {r["pid"] for r in rows if r["split"] == "seen"}
+            unseen = {r["pid"] for r in rows if r["split"] == "unseen"}
+            self.assertEqual(seen, {"t1", "t2"})
+            self.assertEqual(unseen, {"v1", "h1"})
+            self.assertTrue(seen.isdisjoint(unseen))
+            self.assertTrue(all(r["original_split"] == "train"
+                                for r in rows if r["membership"] == "seen"))
+            self.assertTrue(all(r["original_split"] != "train"
+                                for r in rows if r["membership"] == "unseen"))
 
 
 class LikelihoodHelperTest(unittest.TestCase):
