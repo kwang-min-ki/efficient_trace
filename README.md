@@ -172,11 +172,11 @@ Math/code에서 학습 노출 문제(seen)와 미노출 문제(unseen) 비교
 2. **학습 (`train.sh`)**: `VARIANT=clean` 경로 활용, unseen 문제의 학습 유입 방지
 3. **정답률 평가 (추가 구현)**: 동일 모델·생성 조건으로 두 집합의 전체 응답 채점, `reward.py`의 실제 정답 판정 활용 → seen/unseen accuracy 및 memorization gap 산출
 4. Counterfactual test 구축: seen 정답 문제에 한해 같은 풀이가 필요한 변형 문제(숫자·표현 변형) 생성, 원본은 맞고 변형은 틀리는 경우만 memorization(hacking) sample로 라벨링 → IC/RM의 `detect.py label`을 대체하는 memorization 전용 판정 기준
-5. **탐지 점수 비교 (`trace.py`, `likelihood_trace.py`)**: `--variant clean`으로 집합별 평가, `--records`로 두 방법의 응답 공유, 점수 분포·채점 시간·F1 비교
+5. **탐지 점수 비교 (`trace.py`, `likelihood_trace.py`)**: `--variant clean`으로 집합별 평가, `--records`로 두 방법의 응답 공유, hacking/non-hacking 라벨 기준 점수 분포·채점 시간·F1 비교 비교
 
 - 현재 점수 계산은 보상 1 및 비어 있지 않은 추론의 응답만 포함
 - Seen/unseen은 이번 학습의 노출 여부로 구분해서 사전학습 노출 여부는 미확인
-- Seen 자체는 암기 확정 라벨이 아님. 기존 `detect.py label`은 IC/RM 전용이기 때문에 memorization 탐지 F1에는 별도 판정 기준 필요
+- Memorization gap이 유의미하게 커야 seen/unseen 비교가 의미를 가짐
 
 ## 5. 재현 설정
 
