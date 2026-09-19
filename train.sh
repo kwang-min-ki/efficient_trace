@@ -80,7 +80,7 @@ fi
     actor_rollout_ref.model.path="$MODEL" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.use_fused_kernels=True \
-    actor_rollout_ref.model.fused_kernel_options.impl_backend=triton \
+    actor_rollout_ref.model.fused_kernel_options.impl_backend=torch \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
