@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 
 PYTHON_BIN=${PYTHON_BIN:-/venv/verl/bin/python}
 BASE_MODEL=${BASE_MODEL:-meta-llama/Llama-3.2-3B-Instruct}
-TRAINED_MODEL=${TRAINED_MODEL:-ckpt_hf/Llama-3.2-3B-Instruct/code_memorization_seen}
+TRAINED_MODEL=${TRAINED_MODEL:-talzoomanzoo/code_memorization_seen_llama}
 DATA=${DATA:-data/code/memorization}
 OUT=${OUT:-runs/Llama-3.2-3B-Instruct/code_memorization}
 BATCH_SIZE=${BATCH_SIZE:-16}
