@@ -10,6 +10,7 @@ export DATA=${DATA:-data/math/rl/clean}
 export MODEL_TAG=${MODEL_TAG:-$(basename "${MODEL%/}")}
 export CKPT=${CKPT:-ckpt/${MODEL_TAG}/math_memorization_seen}
 export PYTHON_BIN=${PYTHON_BIN:-/venv/verl/bin/python}
+export ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.23}
 
 if [ ! -f "$DATA/train.parquet" ]; then
     echo "missing $DATA/train.parquet; run data.py for math first" >&2
@@ -24,4 +25,6 @@ if ! "$PYTHON_BIN" -c "import torch, verl" 2>/dev/null; then
     exit 1
 fi
 
-exec ./train.sh "$@"
+exec ./train.sh \
+    actor_rollout_ref.rollout.gpu_memory_utilization="$ROLLOUT_GPU_MEMORY_UTILIZATION" \
+    "$@"
