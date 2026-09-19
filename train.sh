@@ -97,6 +97,7 @@ fi
     actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
     actor_rollout_ref.ref.fsdp_config.forward_prefetch=True \
     actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     custom_reward_function.path=reward.py \
     custom_reward_function.name=compute_score \
