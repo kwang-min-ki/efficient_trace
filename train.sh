@@ -13,6 +13,13 @@ MODEL_TAG=${MODEL_TAG:-$(basename "${MODEL%/}")}
 CKPT=${CKPT:-ckpt/${MODEL_TAG}/${TASK}_${VARIANT}}
 LOG_DIR=${LOG_DIR:-logs/${MODEL_TAG}}
 NGPUS=${NGPUS:-1}
+ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.23}
+
+# Qwen's 32K context needs more KV-cache space than a 0.2 reservation provides.
+# Keep this final shared value at or above the known-safe minimum for all launchers.
+if awk -v value="$ROLLOUT_GPU_MEMORY_UTILIZATION" 'BEGIN { exit !(value < 0.23) }'; then
+    ROLLOUT_GPU_MEMORY_UTILIZATION=0.23
+fi
 
 case "$TASK" in
     math|code) ;;
@@ -101,5 +108,7 @@ fi
     trainer.logger=[console] \
     "${ARGS[@]}" \
     "${MODEL_ARGS[@]}" \
-    "$@" 2>&1 | tee "$LOG_DIR/${TASK}_${VARIANT}.log"
+    "$@" \
+    actor_rollout_ref.rollout.gpu_memory_utilization="$ROLLOUT_GPU_MEMORY_UTILIZATION" \
+    2>&1 | tee "$LOG_DIR/${TASK}_${VARIANT}.log"
 
