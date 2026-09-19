@@ -35,8 +35,8 @@ mapfile -d '' -t MODEL_ARGS < "$MODEL_SETTINGS_FILE"
 mkdir -p "$LOG_DIR"
 
 if [ "$TASK" = math ]; then
-    USE_FUSED_KERNELS=True
-    PPO_MAX_TOKEN_LEN_PER_GPU=32768
+    USE_FUSED_KERNELS=False
+    PPO_MAX_TOKEN_LEN_PER_GPU=8192
     ARGS=(
         data.train_batch_size=1024
         data.max_prompt_length=512
