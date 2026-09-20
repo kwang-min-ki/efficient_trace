@@ -32,7 +32,7 @@ exec ./train.sh \
     actor_rollout_ref.model.lora_rank="$LORA_RANK" \
     actor_rollout_ref.model.lora_alpha="$LORA_ALPHA" \
     actor_rollout_ref.model.target_modules=all-linear \
-    actor_rollout_ref.model.lora.merge=False \
+    actor_rollout_ref.model.lora.merge=True \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bf16 \
     actor_rollout_ref.ref.fsdp_config.model_dtype=bf16 \
     actor_rollout_ref.actor.fsdp_config.offload_policy=False \
