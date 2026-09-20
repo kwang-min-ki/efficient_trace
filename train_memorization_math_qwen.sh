@@ -14,6 +14,7 @@ export PYTHON_BIN=${PYTHON_BIN:-/venv/verl/bin/python}
 export ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.4}
 export LORA_RANK=${LORA_RANK:-16}
 export LORA_ALPHA=${LORA_ALPHA:-32}
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 if [ ! -f "$DATA/train.parquet" ]; then
     echo "missing $DATA/train.parquet; run data.py for math first" >&2
@@ -35,11 +36,15 @@ exec ./train.sh \
     actor_rollout_ref.model.lora.merge=True \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bf16 \
     actor_rollout_ref.ref.fsdp_config.model_dtype=bf16 \
+    actor_rollout_ref.actor.strategy=fsdp \
+    actor_rollout_ref.ref.strategy=fsdp \
+    actor_rollout_ref.model.use_fused_kernels=True \
     actor_rollout_ref.actor.fsdp_config.offload_policy=False \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.ref.fsdp_config.param_offload=False \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.ref.fsdp_config.offload_policy=False \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=32768 \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
