@@ -11,7 +11,7 @@ export DATA=${DATA:-data/math/rl/clean}
 export MODEL_TAG=${MODEL_TAG:-$(basename "${MODEL%/}")}
 export CKPT=${CKPT:-ckpt/${MODEL_TAG}/math_memorization_seen}
 export PYTHON_BIN=${PYTHON_BIN:-/venv/verl/bin/python}
-export ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.23}
+export ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.26}
 export LORA_RANK=${LORA_RANK:-16}
 export LORA_ALPHA=${LORA_ALPHA:-32}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
@@ -48,7 +48,7 @@ exec ./train.sh \
     actor_rollout_ref.model.enable_activation_offload=True \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192 \
     actor_rollout_ref.rollout.enforce_eager=True \
-    actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     trainer.val_before_train=False \
     trainer.test_freq=-1 \
     trainer.save_freq=50 \
