@@ -5,8 +5,12 @@ import os
 FRACS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 
 
-# 코드 테스트의 자식 프로세스가 CPU를 사용하므로 동시 작업 수를 CPU 수로 제한
-REWARD_WORKERS = os.cpu_count() or 4
+# 코드 테스트마다 자식 프로세스·파이프·임시 디렉터리를 열기 때문에 CPU가 많은
+# 서버에서도 파일 디스크립터 한도를 소진하지 않도록 기본 동시성을 제한
+REWARD_WORKERS = max(
+    1,
+    int(os.environ.get("REWARD_WORKERS", min(16, os.cpu_count() or 4))),
+)
 
 
 FORCE = {

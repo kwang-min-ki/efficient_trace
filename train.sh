@@ -13,6 +13,13 @@ MODEL_TAG=${MODEL_TAG:-$(basename "${MODEL%/}")}
 CKPT=${CKPT:-ckpt/${MODEL_TAG}/${TASK}_${VARIANT}}
 LOG_DIR=${LOG_DIR:-logs/${MODEL_TAG}}
 NGPUS=${NGPUS:-1}
+ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.23}
+
+# Qwen's 32K context needs more KV-cache space than a 0.2 reservation provides.
+# Keep this final shared value at or above the known-safe minimum for all launchers.
+if awk -v value="$ROLLOUT_GPU_MEMORY_UTILIZATION" 'BEGIN { exit !(value < 0.23) }'; then
+    ROLLOUT_GPU_MEMORY_UTILIZATION=0.23
+fi
 
 case "$TASK" in
     math|code) ;;
@@ -28,6 +35,8 @@ mapfile -d '' -t MODEL_ARGS < "$MODEL_SETTINGS_FILE"
 mkdir -p "$LOG_DIR"
 
 if [ "$TASK" = math ]; then
+    USE_FUSED_KERNELS=False
+    PPO_MAX_TOKEN_LEN_PER_GPU=8192
     ARGS=(
         data.train_batch_size=1024
         data.max_prompt_length=512
@@ -35,12 +44,17 @@ if [ "$TASK" = math ]; then
         data.truncation=error
         actor_rollout_ref.actor.optim.lr=1e-6
         actor_rollout_ref.actor.ppo_mini_batch_size=1024
+        actor_rollout_ref.actor.strategy=fsdp2
+        actor_rollout_ref.actor.fsdp_config.offload_policy=True
+        actor_rollout_ref.ref.strategy=fsdp2
         actor_rollout_ref.rollout.n=5
         algorithm.kl_ctrl.kl_coef=0.001
         trainer.total_epochs=15
     )
 else
     # 대조군도 IC/RM 조건의 입력 예산 사용, 기본 IC
+    USE_FUSED_KERNELS=False
+    PPO_MAX_TOKEN_LEN_PER_GPU=8192
     CODE_SETTING=${CODE_SETTING:-ic}
     if [ "$VARIANT" = rm ]; then CODE_SETTING=rm; fi
     case "$CODE_SETTING" in
@@ -79,17 +93,18 @@ fi
     data.val_files="$DATA/val.parquet" \
     actor_rollout_ref.model.path="$MODEL" \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.model.use_fused_kernels=True \
-    actor_rollout_ref.model.fused_kernel_options.impl_backend=triton \
+    actor_rollout_ref.model.use_fused_kernels="$USE_FUSED_KERNELS" \
+    actor_rollout_ref.model.fused_kernel_options.impl_backend=torch \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=32768 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu="$PPO_MAX_TOKEN_LEN_PER_GPU" \
     actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
     actor_rollout_ref.ref.fsdp_config.forward_prefetch=True \
     actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     custom_reward_function.path=reward.py \
     custom_reward_function.name=compute_score \
@@ -101,5 +116,7 @@ fi
     trainer.logger=[console] \
     "${ARGS[@]}" \
     "${MODEL_ARGS[@]}" \
-    "$@" 2>&1 | tee "$LOG_DIR/${TASK}_${VARIANT}.log"
+    "$@" \
+    actor_rollout_ref.rollout.gpu_memory_utilization="$ROLLOUT_GPU_MEMORY_UTILIZATION" \
+    2>&1 | tee "$LOG_DIR/${TASK}_${VARIANT}.log"
 
